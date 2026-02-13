@@ -1,7 +1,7 @@
 import React, { useState } from 'react'
 import { useQuery } from 'react-query'
 import { useParams, useNavigate } from 'react-router-dom'
-import { Flex, Text, Card, Table, Badge, Box, Tooltip, Spinner, Button, Dialog, Code, Switch } from '@radix-ui/themes'
+import { Flex, Text, Card, Table, Badge, Box, Tooltip, Spinner, Button, Dialog, Code, Switch, RadioGroup } from '@radix-ui/themes'
 import { AppLayout } from '../../components/layout/AppLayout'
 import { useAuth } from '../../contexts/AuthContext'
 import { useHasSpotlightData } from '../../hooks/useHasSpotlightData'
@@ -72,6 +72,8 @@ export const SpotlightSessionDetailPage: React.FC = () => {
   const [showQRCode, setShowQRCode] = useState(false)
   const [showTimeline, setShowTimeline] = useState(false)
   const [applyRedaction, setApplyRedaction] = useState(false)
+  const [showExportDialog, setShowExportDialog] = useState(false)
+  const [exportFormat, setExportFormat] = useState<'json' | 'csv'>('json')
 
   const { data: sessionDetail, isLoading: loadingDetail, refetch } = useQuery<SessionDetail>(
     ['spotlight-session-detail', shareToken],
@@ -423,30 +425,12 @@ export const SpotlightSessionDetailPage: React.FC = () => {
               </Button>
               <Button
                 variant="outline"
-                onClick={() => handleExport('json')}
+                onClick={() => setShowExportDialog(true)}
                 disabled={!isOwner}
                 style={{ cursor: !isOwner ? 'not-allowed' : 'pointer' }}
               >
-                <DownloadIcon /> Export JSON
+                <DownloadIcon /> Export
               </Button>
-              <Button
-                variant="outline"
-                onClick={() => handleExport('csv')}
-                disabled={!isOwner}
-                style={{ cursor: !isOwner ? 'not-allowed' : 'pointer' }}
-              >
-                <DownloadIcon /> Export CSV
-              </Button>
-              {isOwner && (
-                <Flex align="center" gap="2" style={{ border: '1px solid var(--gray-6)', borderRadius: '6px', padding: '4px 10px' }}>
-                  <Text size="1" color="gray">Redact PII</Text>
-                  <Switch
-                    size="1"
-                    checked={applyRedaction}
-                    onCheckedChange={setApplyRedaction}
-                  />
-                </Flex>
-              )}
             </Flex>
 
             {/* Timeline View */}
@@ -454,6 +438,7 @@ export const SpotlightSessionDetailPage: React.FC = () => {
               <SessionTimeline
                 interactions={sessionDetail.interactions}
                 onEventClick={handleTimelineEventClick}
+                selectedInteractionUuid={expandedInteractionUuid}
               />
             )}
 
@@ -729,6 +714,80 @@ export const SpotlightSessionDetailPage: React.FC = () => {
               </Flex>
             )}
           </Box>
+        </Dialog.Content>
+      </Dialog.Root>
+
+      {/* Export Dialog */}
+      <Dialog.Root open={showExportDialog} onOpenChange={setShowExportDialog}>
+        <Dialog.Content style={{ maxWidth: '480px' }}>
+          <Dialog.Title>Export Session</Dialog.Title>
+          <Dialog.Description size="2" mb="4">
+            Download session data with {sessionDetail?.interactions?.length || 0} interactions
+          </Dialog.Description>
+          <Flex direction="column" gap="4">
+            {/* Format Selection */}
+            <Box>
+              <Text size="2" weight="bold" mb="2" style={{ display: 'block' }}>Format</Text>
+              <RadioGroup.Root value={exportFormat} onValueChange={(v) => setExportFormat(v as 'json' | 'csv')}>
+                <Flex direction="column" gap="2">
+                  <Text as="label" size="2">
+                    <Flex gap="2" align="center">
+                      <RadioGroup.Item value="json" />
+                      <Box>
+                        <Text weight="medium">JSON</Text>
+                        <Text size="1" color="gray" style={{ display: 'block' }}>Full session data with nested structures</Text>
+                      </Box>
+                    </Flex>
+                  </Text>
+                  <Text as="label" size="2">
+                    <Flex gap="2" align="center">
+                      <RadioGroup.Item value="csv" />
+                      <Box>
+                        <Text weight="medium">CSV</Text>
+                        <Text size="1" color="gray" style={{ display: 'block' }}>Flattened table format for spreadsheets</Text>
+                      </Box>
+                    </Flex>
+                  </Text>
+                </Flex>
+              </RadioGroup.Root>
+            </Box>
+
+            {/* Redaction Toggle */}
+            <Box>
+              <Flex justify="between" align="center" p="3" style={{ background: 'var(--gray-3)', borderRadius: '6px' }}>
+                <Flex direction="column" gap="1">
+                  <Text size="2" weight="bold">Redact PII</Text>
+                  <Text size="1" color="gray">Apply privacy redaction rules before export</Text>
+                </Flex>
+                <Switch
+                  checked={applyRedaction}
+                  onCheckedChange={setApplyRedaction}
+                />
+              </Flex>
+            </Box>
+
+            {/* Filename Preview */}
+            <Box>
+              <Text size="2" weight="bold" mb="1" style={{ display: 'block' }}>Filename</Text>
+              <Text size="1" color="gray" style={{ fontFamily: 'monospace', background: 'var(--gray-3)', padding: '6px 10px', borderRadius: '4px', display: 'block' }}>
+                session-{sessionDetail?.session.session_id?.slice(0, 8)}-{Date.now()}.{exportFormat}
+              </Text>
+            </Box>
+          </Flex>
+
+          <Flex gap="3" mt="4" justify="end">
+            <Dialog.Close>
+              <Button variant="soft" color="gray">Cancel</Button>
+            </Dialog.Close>
+            <Button
+              onClick={() => {
+                handleExport(exportFormat)
+                setShowExportDialog(false)
+              }}
+            >
+              <DownloadIcon /> Download {exportFormat.toUpperCase()}
+            </Button>
+          </Flex>
         </Dialog.Content>
       </Dialog.Root>
 
