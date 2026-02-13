@@ -5,10 +5,11 @@ import { Flex, Text, Card, Table, Badge, Box, Tooltip, Spinner, Button, Dialog, 
 import { AppLayout } from '../../components/layout/AppLayout'
 import { useAuth } from '../../contexts/AuthContext'
 import { useHasSpotlightData } from '../../hooks/useHasSpotlightData'
-import { ChevronDownIcon, ChevronUpIcon, InfoCircledIcon, ArrowLeftIcon, Share1Icon, CopyIcon } from '@radix-ui/react-icons'
+import { ChevronDownIcon, ChevronUpIcon, InfoCircledIcon, ArrowLeftIcon, Share1Icon, CopyIcon, DownloadIcon } from '@radix-ui/react-icons'
 import { MdQrCode } from 'react-icons/md'
 import { QRCodeSVG } from 'qrcode.react'
 import axios from 'axios'
+import { SessionTimeline } from '../../components/spotlight/SessionTimeline'
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || 'http://localhost:8000'
 const REFRESH_INTERVAL = 5000 // 5 seconds
@@ -69,6 +70,8 @@ export const SpotlightSessionDetailPage: React.FC = () => {
   const [copyLinkSuccess, setCopyLinkSuccess] = useState(false)
   const [loadingShare, setLoadingShare] = useState(false)
   const [showQRCode, setShowQRCode] = useState(false)
+  const [showTimeline, setShowTimeline] = useState(false)
+  const [applyRedaction, setApplyRedaction] = useState(false)
 
   const { data: sessionDetail, isLoading: loadingDetail, refetch } = useQuery<SessionDetail>(
     ['spotlight-session-detail', shareToken],
@@ -304,6 +307,45 @@ export const SpotlightSessionDetailPage: React.FC = () => {
     }
   }
 
+  const handleExport = async (format: 'json' | 'csv') => {
+    if (!sessionDetail || !token) return
+
+    try {
+      const params = new URLSearchParams({ format })
+      if (applyRedaction) params.append('apply_redaction', 'true')
+
+      const response = await axios.get(
+        `${BACKEND_URL}/spotlight/analytics/sessions/${sessionDetail.session.uuid}/export?${params.toString()}`,
+        {
+          headers: { Authorization: `Bearer ${token}` },
+          responseType: 'blob'
+        }
+      )
+
+      const url = window.URL.createObjectURL(new Blob([response.data]))
+      const link = document.createElement('a')
+      link.href = url
+      link.setAttribute('download', `session-${sessionDetail.session.session_id}-${Date.now()}.${format}`)
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      window.URL.revokeObjectURL(url)
+    } catch (error) {
+      console.error('Export failed:', error)
+    }
+  }
+
+  const handleTimelineEventClick = (interactionUuid: string) => {
+    setExpandedInteractionUuid(interactionUuid)
+    // Scroll to the interaction if in table view
+    if (!showTimeline) {
+      const element = document.getElementById(`interaction-${interactionUuid}`)
+      if (element) {
+        element.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      }
+    }
+  }
+
   return (
     <AppLayout>
       <Flex direction="column" gap="4" style={{ padding: '24px' }}>
@@ -365,225 +407,281 @@ export const SpotlightSessionDetailPage: React.FC = () => {
           </Card>
         ) : sessionDetail ? (
           <Flex direction="column" gap="4">
-            {/* Session Summary */}
-            <Card>
-              <Text size="4" weight="bold" style={{ marginBottom: '12px' }}>Session Summary</Text>
-              <Box style={{ overflowX: 'auto', width: '100%' }}>
-                <Table.Root variant="surface">
-                  <Table.Header>
-                    <Table.Row>
-                      <Table.ColumnHeaderCell>Total Requests</Table.ColumnHeaderCell>
-                      <Table.ColumnHeaderCell>Input Tokens</Table.ColumnHeaderCell>
-                      <Table.ColumnHeaderCell>Cache Reads</Table.ColumnHeaderCell>
-                      <Table.ColumnHeaderCell>5m Cache Writes</Table.ColumnHeaderCell>
-                      <Table.ColumnHeaderCell>1h Cache Writes</Table.ColumnHeaderCell>
-                      <Table.ColumnHeaderCell>Output Tokens</Table.ColumnHeaderCell>
-                      {/* <Table.ColumnHeaderCell>Tool Uses</Table.ColumnHeaderCell>
-                      <Table.ColumnHeaderCell>Tool Results</Table.ColumnHeaderCell> */}
-                    </Table.Row>
-                  </Table.Header>
-                  <Table.Body>
-                    <Table.Row>
-                      <Table.Cell>{sessionDetail.session.total_requests}</Table.Cell>
-                      <Table.Cell>{sessionDetail.session.total_input_tokens.toLocaleString()}</Table.Cell>
-                      <Table.Cell>{sessionDetail.session.total_cache_read_input_tokens.toLocaleString()}</Table.Cell>
-                      <Table.Cell>{sessionDetail.session.total_cache_creation_ephemeral_5m_input_tokens.toLocaleString()}</Table.Cell>
-                      <Table.Cell>{sessionDetail.session.total_cache_creation_ephemeral_1h_input_tokens.toLocaleString()}</Table.Cell>
-                      <Table.Cell>{sessionDetail.session.total_output_tokens.toLocaleString()}</Table.Cell>
-                      {/* <Table.Cell>{getSessionToolUses(sessionDetail)}</Table.Cell>
-                      <Table.Cell>{getSessionToolResults(sessionDetail)}</Table.Cell> */}
-                    </Table.Row>
-                  </Table.Body>
-                </Table.Root>
-              </Box>
-            </Card>
+            {/* View Controls */}
+            <Flex gap="2" wrap="wrap">
+              <Button
+                variant={showTimeline ? 'solid' : 'outline'}
+                onClick={() => setShowTimeline(true)}
+              >
+                Timeline View
+              </Button>
+              <Button
+                variant={!showTimeline ? 'solid' : 'outline'}
+                onClick={() => setShowTimeline(false)}
+              >
+                Table View
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => handleExport('json')}
+                disabled={!isOwner}
+                style={{ cursor: !isOwner ? 'not-allowed' : 'pointer' }}
+              >
+                <DownloadIcon /> Export JSON
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => handleExport('csv')}
+                disabled={!isOwner}
+                style={{ cursor: !isOwner ? 'not-allowed' : 'pointer' }}
+              >
+                <DownloadIcon /> Export CSV
+              </Button>
+              {isOwner && (
+                <Flex align="center" gap="2" style={{ border: '1px solid var(--gray-6)', borderRadius: '6px', padding: '4px 10px' }}>
+                  <Text size="1" color="gray">Redact PII</Text>
+                  <Switch
+                    size="1"
+                    checked={applyRedaction}
+                    onCheckedChange={setApplyRedaction}
+                  />
+                </Flex>
+              )}
+            </Flex>
 
-            {/* Completions Table */}
-            <Card>
-              <Text size="4" weight="bold" style={{ marginBottom: '12px' }}>Completions</Text>
-              <Box style={{ overflowX: 'auto', width: '100%' }}>
-                <Table.Root>
-                  <Table.Header>
-                    <Table.Row>
-                      <Table.ColumnHeaderCell>Request</Table.ColumnHeaderCell>
-                      <Table.ColumnHeaderCell>Response</Table.ColumnHeaderCell>
-                      <Table.ColumnHeaderCell>Sent</Table.ColumnHeaderCell>
-                      <Table.ColumnHeaderCell>Latency</Table.ColumnHeaderCell>
-                      <Table.ColumnHeaderCell>Status</Table.ColumnHeaderCell>
-                      <Table.ColumnHeaderCell>Model</Table.ColumnHeaderCell>
-                      <Table.ColumnHeaderCell>Input Tokens</Table.ColumnHeaderCell>
-                      <Table.ColumnHeaderCell>Cache Reads</Table.ColumnHeaderCell>
-                      <Table.ColumnHeaderCell>5m Cache Writes</Table.ColumnHeaderCell>
-                      <Table.ColumnHeaderCell>1h Cache Writes</Table.ColumnHeaderCell>
-                      <Table.ColumnHeaderCell>Output Tokens</Table.ColumnHeaderCell>
-                    </Table.Row>
-                  </Table.Header>
-                <Table.Body>
-                  {sessionDetail.interactions.map((interaction) => (
-                    <React.Fragment key={interaction.uuid}>
-                      <Table.Row
-                        style={{
-                          cursor: 'pointer',
-                          transition: 'background-color 0.15s ease'
-                        }}
-                        onMouseEnter={(e) => e.currentTarget.style.backgroundColor = 'var(--gray-3)'}
-                        onMouseLeave={(e) => e.currentTarget.style.backgroundColor = ''}
-                        onClick={() => setExpandedInteractionUuid(
-                          expandedInteractionUuid === interaction.uuid ? null : interaction.uuid
-                        )}
-                      >
-                        <Table.Cell>
-                          <Flex align="center" gap="1">
-                            {expandedInteractionUuid === interaction.uuid ? <ChevronUpIcon /> : <ChevronDownIcon />}
-                            <Text size="1" style={{ maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                              {getMessagePreview(interaction.request_data?.messages || [])}
-                            </Text>
-                          </Flex>
-                        </Table.Cell>
-                        <Table.Cell>
-                          <Text size="1" style={{ maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                            {interaction.response_data?.content
-                              ? (typeof interaction.response_data.content === 'string'
-                                  ? interaction.response_data.content.substring(0, 50) + (interaction.response_data.content.length > 50 ? '...' : '')
-                                  : getMessagePreview([{ role: 'assistant', content: interaction.response_data.content }]))
-                              : 'N/A'}
-                          </Text>
-                        </Table.Cell>
-                        <Table.Cell>{new Date(interaction.request_timestamp).toLocaleString()}</Table.Cell>
-                        <Table.Cell>{formatLatency(interaction.latency_ms)}</Table.Cell>
-                        <Table.Cell>
-                          <Flex align="center" gap="2">
-                            <Badge color={interaction.status === 'success' ? 'green' : 'red'}>
-                              {interaction.status}
-                            </Badge>
-                            {interaction.status === 'error' && interaction.error_message && (
-                              <Tooltip content={`${interaction.error_type || 'Error'}: ${interaction.error_message}`}>
-                                <InfoCircledIcon style={{ color: 'var(--red-9)', cursor: 'help' }} />
-                              </Tooltip>
-                            )}
-                          </Flex>
-                        </Table.Cell>
-                        <Table.Cell><Badge>{interaction.model}</Badge></Table.Cell>
-                        <Table.Cell>{formatTokenDisplay(interaction.input_tokens, JSON.stringify(interaction.request_data?.messages || ''))}</Table.Cell>
-                        <Table.Cell>{formatTokenDisplay(interaction.cache_read_input_tokens)}</Table.Cell>
-                        <Table.Cell>{formatTokenDisplay(interaction.cache_creation_ephemeral_5m_input_tokens)}</Table.Cell>
-                        <Table.Cell>{formatTokenDisplay(interaction.cache_creation_ephemeral_1h_input_tokens)}</Table.Cell>
-                        <Table.Cell>{formatTokenDisplay(interaction.output_tokens, interaction.response_data?.content || '')}</Table.Cell>
-                      </Table.Row>
+            {/* Timeline View */}
+            {showTimeline && (
+              <SessionTimeline
+                interactions={sessionDetail.interactions}
+                onEventClick={handleTimelineEventClick}
+              />
+            )}
 
-                      {/* Expanded Row */}
-                      {expandedInteractionUuid === interaction.uuid && (
+            {/* Table View Content */}
+            {!showTimeline && (
+              <>
+                {/* Session Summary */}
+                <Card>
+                  <Text size="4" weight="bold" style={{ marginBottom: '12px' }}>Session Summary</Text>
+                  <Box style={{ overflowX: 'auto', width: '100%' }}>
+                    <Table.Root variant="surface">
+                      <Table.Header>
                         <Table.Row>
-                          <Table.Cell colSpan={11} style={{ maxWidth: '0', width: '100%' }}>
-                            <Card style={{ background: 'var(--gray-2)', maxWidth: '100%', overflow: 'hidden' }}>
-                              <Flex direction="column" gap="3" p="3">
-                                {/* Request Metadata Table */}
-                                <Box>
-                                  <Table.Root variant="surface">
-                                    <Table.Header>
-                                      <Table.Row>
-                                        <Table.ColumnHeaderCell>Model</Table.ColumnHeaderCell>
-                                        <Table.ColumnHeaderCell>Provider</Table.ColumnHeaderCell>
-                                        <Table.ColumnHeaderCell>Messages</Table.ColumnHeaderCell>
-                                        <Table.ColumnHeaderCell>Max Tokens</Table.ColumnHeaderCell>
-                                        <Table.ColumnHeaderCell>Temperature</Table.ColumnHeaderCell>
-                                        <Table.ColumnHeaderCell>Stop Reason</Table.ColumnHeaderCell>
-                                      </Table.Row>
-                                    </Table.Header>
-                                    <Table.Body>
-                                      <Table.Row>
-                                        <Table.Cell><Badge>{interaction.model}</Badge></Table.Cell>
-                                        <Table.Cell><Badge>{interaction.provider}</Badge></Table.Cell>
-                                        <Table.Cell>{interaction.request_data?.messages?.length || 0}</Table.Cell>
-                                        <Table.Cell>{interaction.request_data?.max_tokens || 'N/A'}</Table.Cell>
-                                        <Table.Cell>{interaction.request_data?.temperature !== undefined ? interaction.request_data.temperature : 'N/A'}</Table.Cell>
-                                        <Table.Cell>{interaction.response_data?.stop_reason || 'N/A'}</Table.Cell>
-                                      </Table.Row>
-                                    </Table.Body>
-                                  </Table.Root>
-                                </Box>
-
-                                {/* Messages */}
-                                <Box>
-                                  <Flex justify="between" align="center" mb="2">
-                                    <Text size="3" weight="bold">Messages</Text>
-                                    <Button
-                                      variant="soft"
-                                      size="2"
-                                      onClick={() => handleOpenPopout(interaction)}
-                                    >
-                                      ↗ Pop Out
-                                    </Button>
-                                  </Flex>
-                                  <Box style={{
-                                    background: 'var(--gray-3)',
-                                    maxHeight: '400px',
-                                    width: '100%',
-                                    maxWidth: '100%',
-                                    minWidth: '0',
-                                    overflow: 'auto',
-                                    padding: '8px',
-                                    borderRadius: '6px',
-                                    boxSizing: 'border-box',
-                                    wordBreak: 'break-word'
-                                  }}>
-                                    {formatMessages(interaction.request_data?.messages || [])}
-                                  </Box>
-                                </Box>
-
-                                {/* Response */}
-                                {interaction.response_data && (
-                                  <Box>
-                                    <Text size="3" weight="bold" mb="2">Response</Text>
-                                    <Box style={{
-                                      background: 'var(--gray-3)',
-                                      maxHeight: '400px',
-                                      width: '100%',
-                                      maxWidth: '100%',
-                                      minWidth: '0',
-                                      overflow: 'auto',
-                                      padding: '8px',
-                                      borderRadius: '6px',
-                                      boxSizing: 'border-box',
-                                      wordBreak: 'break-word'
-                                    }}>
-                                      {interaction.response_data.content && formatMessages([{ role: 'assistant', content: interaction.response_data.content }])}
-                                    </Box>
-                                  </Box>
-                                )}
-
-                                {/* Tool Usages */}
-                                {interaction.tool_usages && interaction.tool_usages.length > 0 && (
-                                  <Box>
-                                    <Text size="3" weight="bold" mb="2">Tool Usage</Text>
-                                    {interaction.tool_usages.map((tool, idx) => (
-                                      <Card key={idx} mb="2" style={{ background: 'var(--gray-3)' }}>
-                                        <Flex direction="column" gap="2" p="2">
-                                          <Text size="2" weight="bold">{tool.tool_name}</Text>
-                                          <Box>
-                                            <Text size="1" color="gray">Input:</Text>
-                                            <Code size="1">{JSON.stringify(tool.tool_input, null, 2)}</Code>
-                                          </Box>
-                                          <Box>
-                                            <Text size="1" color="gray">Output:</Text>
-                                            <Code size="1">{JSON.stringify(tool.tool_output, null, 2)}</Code>
-                                          </Box>
-                                        </Flex>
-                                      </Card>
-                                    ))}
-                                  </Box>
-                                )}
-                              </Flex>
-                            </Card>
-                          </Table.Cell>
+                          <Table.ColumnHeaderCell>Total Requests</Table.ColumnHeaderCell>
+                          <Table.ColumnHeaderCell>Input Tokens</Table.ColumnHeaderCell>
+                          <Table.ColumnHeaderCell>Cache Reads</Table.ColumnHeaderCell>
+                          <Table.ColumnHeaderCell>5m Cache Writes</Table.ColumnHeaderCell>
+                          <Table.ColumnHeaderCell>1h Cache Writes</Table.ColumnHeaderCell>
+                          <Table.ColumnHeaderCell>Output Tokens</Table.ColumnHeaderCell>
+                          {/* <Table.ColumnHeaderCell>Tool Uses</Table.ColumnHeaderCell>
+                          <Table.ColumnHeaderCell>Tool Results</Table.ColumnHeaderCell> */}
                         </Table.Row>
-                      )}
-                    </React.Fragment>
-                  ))}
-                </Table.Body>
-              </Table.Root>
-              </Box>
-            </Card>
+                      </Table.Header>
+                      <Table.Body>
+                        <Table.Row>
+                          <Table.Cell>{sessionDetail.session.total_requests}</Table.Cell>
+                          <Table.Cell>{sessionDetail.session.total_input_tokens.toLocaleString()}</Table.Cell>
+                          <Table.Cell>{sessionDetail.session.total_cache_read_input_tokens.toLocaleString()}</Table.Cell>
+                          <Table.Cell>{sessionDetail.session.total_cache_creation_ephemeral_5m_input_tokens.toLocaleString()}</Table.Cell>
+                          <Table.Cell>{sessionDetail.session.total_cache_creation_ephemeral_1h_input_tokens.toLocaleString()}</Table.Cell>
+                          <Table.Cell>{sessionDetail.session.total_output_tokens.toLocaleString()}</Table.Cell>
+                          {/* <Table.Cell>{getSessionToolUses(sessionDetail)}</Table.Cell>
+                          <Table.Cell>{getSessionToolResults(sessionDetail)}</Table.Cell> */}
+                        </Table.Row>
+                      </Table.Body>
+                    </Table.Root>
+                  </Box>
+                </Card>
+
+                {/* Completions Table */}
+                <Card>
+                  <Text size="4" weight="bold" style={{ marginBottom: '12px' }}>Completions</Text>
+                  <Box style={{ overflowX: 'auto', width: '100%' }}>
+                    <Table.Root>
+                      <Table.Header>
+                        <Table.Row>
+                          <Table.ColumnHeaderCell>Request</Table.ColumnHeaderCell>
+                          <Table.ColumnHeaderCell>Response</Table.ColumnHeaderCell>
+                          <Table.ColumnHeaderCell>Sent</Table.ColumnHeaderCell>
+                          <Table.ColumnHeaderCell>Latency</Table.ColumnHeaderCell>
+                          <Table.ColumnHeaderCell>Status</Table.ColumnHeaderCell>
+                          <Table.ColumnHeaderCell>Model</Table.ColumnHeaderCell>
+                          <Table.ColumnHeaderCell>Input Tokens</Table.ColumnHeaderCell>
+                          <Table.ColumnHeaderCell>Cache Reads</Table.ColumnHeaderCell>
+                          <Table.ColumnHeaderCell>5m Cache Writes</Table.ColumnHeaderCell>
+                          <Table.ColumnHeaderCell>1h Cache Writes</Table.ColumnHeaderCell>
+                          <Table.ColumnHeaderCell>Output Tokens</Table.ColumnHeaderCell>
+                        </Table.Row>
+                      </Table.Header>
+                      <Table.Body>
+                        {sessionDetail.interactions.map((interaction) => (
+                          <React.Fragment key={interaction.uuid}>
+                            <Table.Row
+                              id={`interaction-${interaction.uuid}`}
+                              style={{
+                                cursor: 'pointer',
+                                transition: 'background-color 0.15s ease'
+                              }}
+                              onMouseEnter={(e) => e.currentTarget.style.backgroundColor = 'var(--gray-3)'}
+                              onMouseLeave={(e) => e.currentTarget.style.backgroundColor = ''}
+                              onClick={() => setExpandedInteractionUuid(
+                                expandedInteractionUuid === interaction.uuid ? null : interaction.uuid
+                              )}
+                            >
+                              <Table.Cell>
+                                <Flex align="center" gap="1">
+                                  {expandedInteractionUuid === interaction.uuid ? <ChevronUpIcon /> : <ChevronDownIcon />}
+                                  <Text size="1" style={{ maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                    {getMessagePreview(interaction.request_data?.messages || [])}
+                                  </Text>
+                                </Flex>
+                              </Table.Cell>
+                              <Table.Cell>
+                                <Text size="1" style={{ maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                  {interaction.response_data?.content
+                                    ? (typeof interaction.response_data.content === 'string'
+                                      ? interaction.response_data.content.substring(0, 50) + (interaction.response_data.content.length > 50 ? '...' : '')
+                                      : getMessagePreview([{ role: 'assistant', content: interaction.response_data.content }]))
+                                    : 'N/A'}
+                                </Text>
+                              </Table.Cell>
+                              <Table.Cell>{new Date(interaction.request_timestamp).toLocaleString()}</Table.Cell>
+                              <Table.Cell>{formatLatency(interaction.latency_ms)}</Table.Cell>
+                              <Table.Cell>
+                                <Flex align="center" gap="2">
+                                  <Badge color={interaction.status === 'success' ? 'green' : 'red'}>
+                                    {interaction.status}
+                                  </Badge>
+                                  {interaction.status === 'error' && interaction.error_message && (
+                                    <Tooltip content={`${interaction.error_type || 'Error'}: ${interaction.error_message}`}>
+                                      <InfoCircledIcon style={{ color: 'var(--red-9)', cursor: 'help' }} />
+                                    </Tooltip>
+                                  )}
+                                </Flex>
+                              </Table.Cell>
+                              <Table.Cell><Badge>{interaction.model}</Badge></Table.Cell>
+                              <Table.Cell>{formatTokenDisplay(interaction.input_tokens, JSON.stringify(interaction.request_data?.messages || ''))}</Table.Cell>
+                              <Table.Cell>{formatTokenDisplay(interaction.cache_read_input_tokens)}</Table.Cell>
+                              <Table.Cell>{formatTokenDisplay(interaction.cache_creation_ephemeral_5m_input_tokens)}</Table.Cell>
+                              <Table.Cell>{formatTokenDisplay(interaction.cache_creation_ephemeral_1h_input_tokens)}</Table.Cell>
+                              <Table.Cell>{formatTokenDisplay(interaction.output_tokens, interaction.response_data?.content || '')}</Table.Cell>
+                            </Table.Row>
+
+                            {/* Expanded Row */}
+                            {expandedInteractionUuid === interaction.uuid && (
+                              <Table.Row>
+                                <Table.Cell colSpan={11} style={{ maxWidth: '0', width: '100%' }}>
+                                  <Card style={{ background: 'var(--gray-2)', maxWidth: '100%', overflow: 'hidden' }}>
+                                    <Flex direction="column" gap="3" p="3">
+                                      {/* Request Metadata Table */}
+                                      <Box>
+                                        <Table.Root variant="surface">
+                                          <Table.Header>
+                                            <Table.Row>
+                                              <Table.ColumnHeaderCell>Model</Table.ColumnHeaderCell>
+                                              <Table.ColumnHeaderCell>Provider</Table.ColumnHeaderCell>
+                                              <Table.ColumnHeaderCell>Messages</Table.ColumnHeaderCell>
+                                              <Table.ColumnHeaderCell>Max Tokens</Table.ColumnHeaderCell>
+                                              <Table.ColumnHeaderCell>Temperature</Table.ColumnHeaderCell>
+                                              <Table.ColumnHeaderCell>Stop Reason</Table.ColumnHeaderCell>
+                                            </Table.Row>
+                                          </Table.Header>
+                                          <Table.Body>
+                                            <Table.Row>
+                                              <Table.Cell><Badge>{interaction.model}</Badge></Table.Cell>
+                                              <Table.Cell><Badge>{interaction.provider}</Badge></Table.Cell>
+                                              <Table.Cell>{interaction.request_data?.messages?.length || 0}</Table.Cell>
+                                              <Table.Cell>{interaction.request_data?.max_tokens || 'N/A'}</Table.Cell>
+                                              <Table.Cell>{interaction.request_data?.temperature !== undefined ? interaction.request_data.temperature : 'N/A'}</Table.Cell>
+                                              <Table.Cell>{interaction.response_data?.stop_reason || 'N/A'}</Table.Cell>
+                                            </Table.Row>
+                                          </Table.Body>
+                                        </Table.Root>
+                                      </Box>
+
+                                      {/* Messages */}
+                                      <Box>
+                                        <Flex justify="between" align="center" mb="2">
+                                          <Text size="3" weight="bold">Messages</Text>
+                                          <Button
+                                            variant="soft"
+                                            size="2"
+                                            onClick={() => handleOpenPopout(interaction)}
+                                          >
+                                            ↗ Pop Out
+                                          </Button>
+                                        </Flex>
+                                        <Box style={{
+                                          background: 'var(--gray-3)',
+                                          maxHeight: '400px',
+                                          width: '100%',
+                                          maxWidth: '100%',
+                                          minWidth: '0',
+                                          overflow: 'auto',
+                                          padding: '8px',
+                                          borderRadius: '6px',
+                                          boxSizing: 'border-box',
+                                          wordBreak: 'break-word'
+                                        }}>
+                                          {formatMessages(interaction.request_data?.messages || [])}
+                                        </Box>
+                                      </Box>
+
+                                      {/* Response */}
+                                      {interaction.response_data && (
+                                        <Box>
+                                          <Text size="3" weight="bold" mb="2">Response</Text>
+                                          <Box style={{
+                                            background: 'var(--gray-3)',
+                                            maxHeight: '400px',
+                                            width: '100%',
+                                            maxWidth: '100%',
+                                            minWidth: '0',
+                                            overflow: 'auto',
+                                            padding: '8px',
+                                            borderRadius: '6px',
+                                            boxSizing: 'border-box',
+                                            wordBreak: 'break-word'
+                                          }}>
+                                            {interaction.response_data.content && formatMessages([{ role: 'assistant', content: interaction.response_data.content }])}
+                                          </Box>
+                                        </Box>
+                                      )}
+
+                                      {/* Tool Usages */}
+                                      {interaction.tool_usages && interaction.tool_usages.length > 0 && (
+                                        <Box>
+                                          <Text size="3" weight="bold" mb="2">Tool Usage</Text>
+                                          {interaction.tool_usages.map((tool, idx) => (
+                                            <Card key={idx} mb="2" style={{ background: 'var(--gray-3)' }}>
+                                              <Flex direction="column" gap="2" p="2">
+                                                <Text size="2" weight="bold">{tool.tool_name}</Text>
+                                                <Box>
+                                                  <Text size="1" color="gray">Input:</Text>
+                                                  <Code size="1">{JSON.stringify(tool.tool_input, null, 2)}</Code>
+                                                </Box>
+                                                <Box>
+                                                  <Text size="1" color="gray">Output:</Text>
+                                                  <Code size="1">{JSON.stringify(tool.tool_output, null, 2)}</Code>
+                                                </Box>
+                                              </Flex>
+                                            </Card>
+                                          ))}
+                                        </Box>
+                                      )}
+                                    </Flex>
+                                  </Card>
+                                </Table.Cell>
+                              </Table.Row>
+                            )}
+                          </React.Fragment>
+                        ))}
+                      </Table.Body>
+                    </Table.Root>
+                  </Box>
+                </Card>
+              </>
+            )}
           </Flex>
         ) : (
           <Card>

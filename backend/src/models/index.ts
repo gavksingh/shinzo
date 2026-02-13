@@ -23,6 +23,7 @@ import { TokenCountRequest } from './spotlight/TokenCountRequest'
 import { Tool } from './spotlight/Tool'
 import { ToolUsage } from './spotlight/ToolUsage'
 import { UserAnalytics } from './spotlight/UserAnalytics'
+import { RedactionRule } from './spotlight/RedactionRule'
 
 export {
   User,
@@ -50,4 +51,5 @@ export {
   Tool,
   ToolUsage,
   UserAnalytics,
+  RedactionRule,
 }

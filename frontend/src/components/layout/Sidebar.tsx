@@ -29,6 +29,11 @@ const aiAnalyticsItems = {
       name: 'API Keys',
       href: '/spotlight/api-keys',
       icon: Icons.LockClosedIcon,
+    },
+    {
+      name: 'Settings',
+      href: '/settings',
+      icon: Icons.GearIcon,
     }
   ]
 }

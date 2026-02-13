@@ -26,7 +26,8 @@ import {
   TokenCountRequest,
   Tool,
   ToolUsage,
-  UserAnalytics
+  UserAnalytics,
+  RedactionRule
 } from './models'
 
 logger.info('STARTUP: dbClient - About to create Sequelize instance')
@@ -115,6 +116,7 @@ TokenCountRequest.initialize(sequelize)
 Tool.initialize(sequelize)
 ToolUsage.initialize(sequelize)
 UserAnalytics.initialize(sequelize)
+RedactionRule.initialize(sequelize)
 logger.info('STARTUP: dbClient - All models initialized')
 
 // Set up associations
@@ -201,6 +203,9 @@ ToolUsage.belongsTo(Interaction, { foreignKey: 'interaction_uuid', as: 'interact
 ToolUsage.belongsTo(Tool, { foreignKey: 'tool_uuid', as: 'tool' })
 
 UserAnalytics.belongsTo(User, { foreignKey: 'user_uuid', as: 'user' })
+
+User.hasMany(RedactionRule, { foreignKey: 'user_uuid', as: 'redactionRules' })
+RedactionRule.belongsTo(User, { foreignKey: 'user_uuid', as: 'user' })
 
 logger.info('STARTUP: dbClient - All associations set up, dbClient module loaded successfully')
 export const dbClient = sequelize

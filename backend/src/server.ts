@@ -106,6 +106,18 @@ import {
   handleDeleteSessionShare,
   handleGetSessionShareStatus,
   handleFetchSharedSessionDetail,
+  // Session replay handlers
+  handleSearchSessions,
+  searchSessionsSchema,
+  handleExportSession,
+  exportSessionSchema,
+  // Redaction rule handlers
+  handleFetchRedactionRules,
+  handleCreateRedactionRule,
+  createRedactionRuleSchema,
+  handleUpdateRedactionRule,
+  updateRedactionRuleSchema,
+  handleDeleteRedactionRule,
 } from './handlers/spotlight'
 
 logger.info('STARTUP: server.ts - All imports loaded, creating Fastify instance')
@@ -921,7 +933,7 @@ app.all('/spotlight/:provider/v1/*', async (request: FastifyRequest, reply: Fast
     const shinzoCredentials = await authenticatedShinzoCredentials(request)
     if (!shinzoCredentials.apiKey) {
       reply.status(401).send({ error: 'Shinzo API key authentication failed' })
-      return    
+      return
     }
 
     // Extract the endpoint path including /v1/ prefix
@@ -941,7 +953,7 @@ app.all('/spotlight/:provider/v1/*', async (request: FastifyRequest, reply: Fast
     }
 
     if (provider === 'anthropic') {
-      switch(endpointPath) {
+      switch (endpointPath) {
         case modelAPISpec.anthropic.countTokens:
           result = await handleCountTokens(
             shinzoCredentials,
@@ -1124,6 +1136,118 @@ app.get('/spotlight/analytics/sessions/shared/:shareToken', async (request: Fast
     reply.status(result.status || 200).send(result.response)
   } catch (error: any) {
     logger.error({ message: 'Fetch shared session detail error', error })
+    reply.status(500).send({ error: 'Internal server error' })
+  }
+})
+
+// Session Replay: Search sessions with advanced filters
+app.get('/spotlight/analytics/sessions/search', async (request: AuthenticatedRequest, reply: FastifyReply) => {
+  const authenticated = await authenticateJWT(request, reply)
+  if (!authenticated) return
+
+  try {
+    const validatedQuery = await searchSessionsSchema.validate(request.query, {
+      abortEarly: false,
+      stripUnknown: true
+    })
+    const result = await handleSearchSessions(request.user!.uuid, validatedQuery)
+    reply.status(result.status || 200).send(result.response)
+  } catch (error: any) {
+    logger.error({ message: 'Search sessions error', error })
+    reply.status(500).send({ error: 'Internal server error' })
+  }
+})
+
+// Session Replay: Export session data
+app.get('/spotlight/analytics/sessions/:sessionUuid/export', async (request: AuthenticatedRequest, reply: FastifyReply) => {
+  const authenticated = await authenticateJWT(request, reply)
+  if (!authenticated) return
+
+  try {
+    const { sessionUuid } = request.params as { sessionUuid: string }
+    const validatedQuery = await exportSessionSchema.validate(request.query, {
+      abortEarly: false,
+      stripUnknown: true
+    })
+
+    const result = await handleExportSession(request.user!.uuid, sessionUuid, validatedQuery)
+
+    if (result.error) {
+      reply.status(result.status || 500).send(result.response)
+      return
+    }
+
+    const format = validatedQuery?.format || 'json'
+    const filename = `session-${sessionUuid}-${Date.now()}.${format}`
+
+    reply.header('Content-Disposition', `attachment; filename="${filename}"`)
+    reply.header('Content-Type', format === 'json' ? 'application/json' : 'text/csv')
+    reply.status(200).send(result.response)
+  } catch (error: any) {
+    logger.error({ message: 'Export session error', error })
+    reply.status(500).send({ error: 'Internal server error' })
+  }
+})
+
+// Redaction Rules CRUD
+app.get('/spotlight/redaction-rules', async (request: AuthenticatedRequest, reply: FastifyReply) => {
+  const authenticated = await authenticateJWT(request, reply)
+  if (!authenticated) return
+
+  try {
+    const result = await handleFetchRedactionRules(request.user!.uuid)
+    reply.status(result.status || 200).send(result.response)
+  } catch (error: any) {
+    logger.error({ message: 'Fetch redaction rules error', error })
+    reply.status(500).send({ error: 'Internal server error' })
+  }
+})
+
+app.post('/spotlight/redaction-rules', async (request: AuthenticatedRequest, reply: FastifyReply) => {
+  const authenticated = await authenticateJWT(request, reply)
+  if (!authenticated) return
+
+  try {
+    const validatedBody = await createRedactionRuleSchema.validate(request.body, {
+      abortEarly: false,
+      stripUnknown: true
+    })
+    const result = await handleCreateRedactionRule(request.user!.uuid, validatedBody)
+    reply.status(result.status || 200).send(result.response)
+  } catch (error: any) {
+    logger.error({ message: 'Create redaction rule error', error })
+    reply.status(500).send({ error: 'Internal server error' })
+  }
+})
+
+app.put('/spotlight/redaction-rules/:ruleUuid', async (request: AuthenticatedRequest, reply: FastifyReply) => {
+  const authenticated = await authenticateJWT(request, reply)
+  if (!authenticated) return
+
+  try {
+    const { ruleUuid } = request.params as { ruleUuid: string }
+    const validatedBody = await updateRedactionRuleSchema.validate(request.body, {
+      abortEarly: false,
+      stripUnknown: true
+    })
+    const result = await handleUpdateRedactionRule(request.user!.uuid, ruleUuid, validatedBody)
+    reply.status(result.status || 200).send(result.response)
+  } catch (error: any) {
+    logger.error({ message: 'Update redaction rule error', error })
+    reply.status(500).send({ error: 'Internal server error' })
+  }
+})
+
+app.delete('/spotlight/redaction-rules/:ruleUuid', async (request: AuthenticatedRequest, reply: FastifyReply) => {
+  const authenticated = await authenticateJWT(request, reply)
+  if (!authenticated) return
+
+  try {
+    const { ruleUuid } = request.params as { ruleUuid: string }
+    const result = await handleDeleteRedactionRule(request.user!.uuid, ruleUuid)
+    reply.status(result.status || 200).send(result.response)
+  } catch (error: any) {
+    logger.error({ message: 'Delete redaction rule error', error })
     reply.status(500).send({ error: 'Internal server error' })
   }
 })
