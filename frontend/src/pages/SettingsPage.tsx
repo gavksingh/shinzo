@@ -1,5 +1,6 @@
-import React, { useState } from 'react'
+import React, { useState, useEffect } from 'react'
 import { useMutation, useQuery, useQueryClient } from 'react-query'
+import { useLocation } from 'react-router-dom'
 import { AppLayout } from '../components/layout/AppLayout'
 import { Button, TextField, Card, Flex, Text, Heading, Select, Box, Tabs, Switch, Badge, Dialog } from '@radix-ui/themes'
 import * as Icons from '@radix-ui/react-icons'
@@ -58,8 +59,17 @@ export const SettingsPage: React.FC = () => {
   const auth = useAuth()
   const { token, user, logout } = auth
   const queryClient = useQueryClient()
+  const location = useLocation()
 
   const [activeTab, setActiveTab] = useState('profile')
+
+  // Support URL hash-based tab navigation (e.g., /settings#privacy)
+  useEffect(() => {
+    const hash = location.hash.replace('#', '')
+    if (hash && ['profile', 'accounts', 'tokens', 'privacy'].includes(hash)) {
+      setActiveTab(hash)
+    }
+  }, [location.hash])
   const [isChangingPassword, setIsChangingPassword] = useState(false)
   const [passwordForm, setPasswordForm] = useState({
     current_password: '',
@@ -645,16 +655,18 @@ export const SettingsPage: React.FC = () => {
                     <Flex direction="column" gap="3">
                       {/* Built-in rules */}
                       {redactionRules?.filter(r => r.is_builtin).map(rule => (
-                        <Card key={rule.uuid} style={{ backgroundColor: rule.is_enabled ? 'var(--green-2)' : 'var(--gray-2)' }}>
+                        <Card key={rule.uuid} style={{ border: rule.is_enabled ? '2px solid var(--green-9)' : '1px solid var(--gray-6)' }}>
                           <Flex justify="between" align="center">
-                            <Flex align="center" gap="3">
-                              <Box style={{ fontSize: '18px' }}>🔒</Box>
-                              <Flex direction="column" gap="1">
-                                <Flex align="center" gap="2">
+                            <Flex align="center" gap="3" style={{ minWidth: 0, flex: 1 }}>
+                              <Box style={{ fontSize: '18px', flexShrink: 0 }}>🔒</Box>
+                              <Flex direction="column" gap="1" style={{ minWidth: 0, flex: 1 }}>
+                                <Flex align="center" gap="2" style={{ minHeight: '20px' }}>
                                   <Text size="2" weight="medium">{rule.rule_name}</Text>
                                   <Badge size="1" color="blue">Built-in</Badge>
+                                  <Box style={{ minWidth: '50px', display: 'inline-flex' }}>
+                                    {rule.is_enabled && <Badge size="1" color="green">Active</Badge>}
+                                  </Box>
                                 </Flex>
-                                <Text size="1" color="gray" style={{ fontFamily: 'monospace' }}>{rule.pattern}</Text>
                                 <Text size="1" color="gray">Replaces with: {rule.replacement}</Text>
                               </Flex>
                             </Flex>
@@ -668,16 +680,18 @@ export const SettingsPage: React.FC = () => {
 
                       {/* Custom rules */}
                       {redactionRules?.filter(r => !r.is_builtin).map(rule => (
-                        <Card key={rule.uuid} style={{ backgroundColor: rule.is_enabled ? 'var(--blue-2)' : 'var(--gray-2)' }}>
+                        <Card key={rule.uuid} style={{ border: rule.is_enabled ? '2px solid var(--purple-9)' : '1px solid var(--gray-6)' }}>
                           <Flex justify="between" align="center">
-                            <Flex align="center" gap="3">
-                              <Box style={{ fontSize: '18px' }}>✏️</Box>
-                              <Flex direction="column" gap="1">
-                                <Flex align="center" gap="2">
+                            <Flex align="center" gap="3" style={{ minWidth: 0, flex: 1 }}>
+                              <Box style={{ fontSize: '18px', flexShrink: 0 }}>✏️</Box>
+                              <Flex direction="column" gap="1" style={{ minWidth: 0, flex: 1 }}>
+                                <Flex align="center" gap="2" style={{ minHeight: '20px' }}>
                                   <Text size="2" weight="medium">{rule.rule_name}</Text>
                                   <Badge size="1" color="purple">Custom</Badge>
+                                  <Box style={{ minWidth: '50px', display: 'inline-flex' }}>
+                                    {rule.is_enabled && <Badge size="1" color="green">Active</Badge>}
+                                  </Box>
                                 </Flex>
-                                <Text size="1" color="gray" style={{ fontFamily: 'monospace' }}>{rule.pattern}</Text>
                                 <Text size="1" color="gray">Replaces with: {rule.replacement}</Text>
                               </Flex>
                             </Flex>

@@ -218,7 +218,7 @@ export const SessionTimeline: React.FC<SessionTimelineProps> = ({
             <Select.Root value={filter} onValueChange={(v) => setFilter(v as FilterType)}>
               <Select.Trigger variant="soft" />
               <Select.Content>
-                <Select.Item value="all">All Events ({counts.all})</Select.Item>
+                <Select.Item value="all">All Events ({filteredGroups.length} interactions)</Select.Item>
                 <Select.Item value="requests">Requests ({counts.requests})</Select.Item>
                 <Select.Item value="errors">Errors ({counts.errors})</Select.Item>
                 <Select.Item value="tools">Tool Calls ({counts.tools})</Select.Item>

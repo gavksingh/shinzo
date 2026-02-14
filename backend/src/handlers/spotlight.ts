@@ -1899,6 +1899,159 @@ export const handleExportSession = async (
 }
 
 // ============================================================================
+// Session Analytics Summary & Time Series
+// ============================================================================
+
+export const analyticsTimeSeriesSchema = yup.object({
+  days: yup.number().min(1).max(90).default(30),
+}).optional()
+
+export const handleSessionAnalyticsSummary = async (userUuid: string) => {
+  try {
+    logger.debug({ message: 'Fetching session analytics summary', userUuid })
+
+    // Total sessions + error sessions + average duration
+    const [summaryResults] = await sequelize.query(`
+      SELECT
+        COUNT(*)::int AS total_sessions,
+        COUNT(CASE WHEN error_count > 0 THEN 1 END)::int AS error_sessions,
+        ROUND(AVG(EXTRACT(EPOCH FROM (end_time - start_time)))::numeric, 1) AS avg_duration_seconds,
+        COALESCE(SUM(total_requests), 0)::int AS total_interactions
+      FROM spotlight.session
+      WHERE user_uuid = :userUuid
+    `, { replacements: { userUuid } })
+
+    // Sessions in last 24h, 7d, 30d
+    const [trendResults] = await sequelize.query(`
+      SELECT
+        COUNT(CASE WHEN start_time >= NOW() - INTERVAL '24 hours' THEN 1 END)::int AS sessions_24h,
+        COUNT(CASE WHEN start_time >= NOW() - INTERVAL '7 days' THEN 1 END)::int AS sessions_7d,
+        COUNT(CASE WHEN start_time >= NOW() - INTERVAL '30 days' THEN 1 END)::int AS sessions_30d
+      FROM spotlight.session
+      WHERE user_uuid = :userUuid
+    `, { replacements: { userUuid } })
+
+    // Top models by usage
+    const [modelResults] = await sequelize.query(`
+      SELECT
+        i.model,
+        COUNT(*)::int AS usage_count,
+        COUNT(DISTINCT i.session_uuid)::int AS session_count
+      FROM spotlight.interaction i
+      JOIN spotlight.session s ON s.uuid = i.session_uuid
+      WHERE s.user_uuid = :userUuid
+        AND i.model IS NOT NULL
+      GROUP BY i.model
+      ORDER BY usage_count DESC
+      LIMIT 5
+    `, { replacements: { userUuid } })
+
+    // Top providers
+    const [providerResults] = await sequelize.query(`
+      SELECT
+        i.provider,
+        COUNT(*)::int AS usage_count
+      FROM spotlight.interaction i
+      JOIN spotlight.session s ON s.uuid = i.session_uuid
+      WHERE s.user_uuid = :userUuid
+        AND i.provider IS NOT NULL
+      GROUP BY i.provider
+      ORDER BY usage_count DESC
+      LIMIT 5
+    `, { replacements: { userUuid } })
+
+    const summary = (summaryResults as any[])[0] || {}
+    const trends = (trendResults as any[])[0] || {}
+    const errorRate = summary.total_sessions > 0
+      ? Math.round((summary.error_sessions / summary.total_sessions) * 100)
+      : 0
+
+    return {
+      response: {
+        total_sessions: summary.total_sessions || 0,
+        error_sessions: summary.error_sessions || 0,
+        error_rate: errorRate,
+        avg_duration_seconds: parseFloat(summary.avg_duration_seconds) || 0,
+        total_interactions: summary.total_interactions || 0,
+        sessions_24h: trends.sessions_24h || 0,
+        sessions_7d: trends.sessions_7d || 0,
+        sessions_30d: trends.sessions_30d || 0,
+        top_models: modelResults || [],
+        top_providers: providerResults || [],
+      },
+      status: 200
+    }
+  } catch (error) {
+    logger.error({ message: 'Error fetching session analytics summary', error, userUuid })
+    return { response: 'Error fetching session analytics summary', error: true, status: 500 }
+  }
+}
+
+export const handleSessionAnalyticsTimeSeries = async (
+  userUuid: string,
+  options?: yup.InferType<typeof analyticsTimeSeriesSchema>
+) => {
+  try {
+    const days = options?.days || 30
+    logger.debug({ message: 'Fetching session analytics time series', userUuid, days })
+
+    // Daily session counts + error counts
+    const [dailyResults] = await sequelize.query(`
+      SELECT
+        d.date::text AS date,
+        COALESCE(counts.session_count, 0)::int AS session_count,
+        COALESCE(counts.error_count, 0)::int AS error_count,
+        COALESCE(counts.interaction_count, 0)::int AS interaction_count
+      FROM generate_series(
+        (NOW() - INTERVAL '1 day' * :days)::date,
+        NOW()::date,
+        '1 day'::interval
+      ) AS d(date)
+      LEFT JOIN (
+        SELECT
+          start_time::date AS day,
+          COUNT(*)::int AS session_count,
+          COUNT(CASE WHEN error_count > 0 THEN 1 END)::int AS error_count,
+          COALESCE(SUM(total_requests), 0)::int AS interaction_count
+        FROM spotlight.session
+        WHERE user_uuid = :userUuid
+          AND start_time >= NOW() - INTERVAL '1 day' * :days
+        GROUP BY start_time::date
+      ) counts ON counts.day = d.date::date
+      ORDER BY d.date ASC
+    `, { replacements: { userUuid, days } })
+
+    // Model usage breakdown for the period
+    const [modelBreakdown] = await sequelize.query(`
+      SELECT
+        i.model,
+        COUNT(*)::int AS usage_count,
+        COALESCE(SUM(i.input_tokens), 0)::bigint AS total_input_tokens,
+        COALESCE(SUM(i.output_tokens), 0)::bigint AS total_output_tokens
+      FROM spotlight.interaction i
+      JOIN spotlight.session s ON s.uuid = i.session_uuid
+      WHERE s.user_uuid = :userUuid
+        AND i.request_timestamp >= NOW() - INTERVAL '1 day' * :days
+        AND i.model IS NOT NULL
+      GROUP BY i.model
+      ORDER BY usage_count DESC
+    `, { replacements: { userUuid, days } })
+
+    return {
+      response: {
+        days,
+        daily: dailyResults || [],
+        model_breakdown: modelBreakdown || [],
+      },
+      status: 200
+    }
+  } catch (error) {
+    logger.error({ message: 'Error fetching session analytics time series', error, userUuid })
+    return { response: 'Error fetching session analytics time series', error: true, status: 500 }
+  }
+}
+
+// ============================================================================
 // Redaction Rule CRUD Operations
 // ============================================================================
 

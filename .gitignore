@@ -28,9 +28,4 @@ coverage/
 # Local development
 dev/
 
-# Local dev Docker (not for PRs)
-docker-compose.dev.yml
-Dockerfile.dev.*
-**/.dockerignore
-
 CLAUDE.md

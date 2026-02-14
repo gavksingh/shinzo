@@ -2,6 +2,7 @@ import React, { useState } from 'react'
 import { useQuery } from 'react-query'
 import { useNavigate } from 'react-router-dom'
 import { Flex, Text, Card, Table, Badge, Grid, Spinner, Box } from '@radix-ui/themes'
+import { SessionSummaryCards, SessionCharts } from '../../components/spotlight/SessionCharts'
 import { AppLayout } from '../../components/layout/AppLayout'
 import { useAuth } from '../../contexts/AuthContext'
 import { spotlightService, SessionAnalyticsResponse } from '../../backendService'
@@ -172,9 +173,16 @@ export const SpotlightSessionAnalyticsPage: React.FC = () => {
           </>
         )}
       </Flex>
+
+      {/* Session Analytics Summary + Charts */}
+      <Flex direction="column" gap="4" style={{ padding: '0 24px' }}>
+        <SessionSummaryCards />
+        <SessionCharts />
+      </Flex>
+
       <Flex direction="column" gap="4" style={{ padding: '24px' }}>
         <Flex direction="column" gap="2">
-          <Text size="6" weight="bold">Session Analytics</Text>
+          <Text size="6" weight="bold">Recent Sessions</Text>
           <Text size="2" color="gray">Review conversation sessions and interaction details</Text>
         </Flex>
 

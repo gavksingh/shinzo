@@ -5,7 +5,7 @@ import { Flex, Text, Card, Table, Badge, Box, Tooltip, Spinner, Button, Dialog, 
 import { AppLayout } from '../../components/layout/AppLayout'
 import { useAuth } from '../../contexts/AuthContext'
 import { useHasSpotlightData } from '../../hooks/useHasSpotlightData'
-import { ChevronDownIcon, ChevronUpIcon, InfoCircledIcon, ArrowLeftIcon, Share1Icon, CopyIcon, DownloadIcon } from '@radix-ui/react-icons'
+import { ChevronDownIcon, ChevronUpIcon, InfoCircledIcon, ArrowLeftIcon, Share1Icon, CopyIcon, DownloadIcon, GearIcon } from '@radix-ui/react-icons'
 import { MdQrCode } from 'react-icons/md'
 import { QRCodeSVG } from 'qrcode.react'
 import axios from 'axios'
@@ -763,6 +763,20 @@ export const SpotlightSessionDetailPage: React.FC = () => {
                   checked={applyRedaction}
                   onCheckedChange={setApplyRedaction}
                 />
+              </Flex>
+              <Flex justify="end" mt="1">
+                <Button
+                  variant="ghost"
+                  size="1"
+                  style={{ cursor: 'pointer', color: 'var(--blue-10)' }}
+                  onClick={() => {
+                    setShowExportDialog(false)
+                    navigate('/settings#privacy')
+                  }}
+                >
+                  <GearIcon />
+                  Configure redaction rules
+                </Button>
               </Flex>
             </Box>
 

@@ -111,6 +111,10 @@ import {
   searchSessionsSchema,
   handleExportSession,
   exportSessionSchema,
+  // Session analytics summary & time series
+  handleSessionAnalyticsSummary,
+  handleSessionAnalyticsTimeSeries,
+  analyticsTimeSeriesSchema,
   // Redaction rule handlers
   handleFetchRedactionRules,
   handleCreateRedactionRule,
@@ -1185,6 +1189,38 @@ app.get('/spotlight/analytics/sessions/:sessionUuid/export', async (request: Aut
     reply.status(200).send(result.response)
   } catch (error: any) {
     logger.error({ message: 'Export session error', error })
+    reply.status(500).send({ error: 'Internal server error' })
+  }
+})
+
+// Session Analytics Summary
+app.get('/spotlight/analytics/sessions/summary', async (request: AuthenticatedRequest, reply: FastifyReply) => {
+  const authenticated = await authenticateJWT(request, reply)
+  if (!authenticated) return
+
+  try {
+    const result = await handleSessionAnalyticsSummary(request.user!.uuid)
+    reply.status(result.status || 200).send(result.response)
+  } catch (error: any) {
+    logger.error({ message: 'Fetch session analytics summary error', error })
+    reply.status(500).send({ error: 'Internal server error' })
+  }
+})
+
+// Session Analytics Time Series
+app.get('/spotlight/analytics/sessions/timeseries', async (request: AuthenticatedRequest, reply: FastifyReply) => {
+  const authenticated = await authenticateJWT(request, reply)
+  if (!authenticated) return
+
+  try {
+    const validatedQuery = await analyticsTimeSeriesSchema.validate(request.query, {
+      abortEarly: false,
+      stripUnknown: true
+    })
+    const result = await handleSessionAnalyticsTimeSeries(request.user!.uuid, validatedQuery)
+    reply.status(result.status || 200).send(result.response)
+  } catch (error: any) {
+    logger.error({ message: 'Fetch session analytics time series error', error })
     reply.status(500).send({ error: 'Internal server error' })
   }
 })
