@@ -13,6 +13,9 @@ export class Session extends CommonModel {
   public total_output_tokens!: number
   public total_cache_creation_ephemeral_5m_input_tokens!: number
   public total_cache_creation_ephemeral_1h_input_tokens!: number
+  public environment!: object
+  public metadata!: object
+  public error_count!: number
 
   static initialize(sequelize: Sequelize) {
     Session.init(
@@ -66,6 +69,21 @@ export class Session extends CommonModel {
         total_cache_creation_ephemeral_1h_input_tokens: {
           type: DataTypes.INTEGER,
           allowNull: false,
+          defaultValue: 0,
+        },
+        environment: {
+          type: DataTypes.JSONB,
+          allowNull: true,
+          defaultValue: {},
+        },
+        metadata: {
+          type: DataTypes.JSONB,
+          allowNull: true,
+          defaultValue: {},
+        },
+        error_count: {
+          type: DataTypes.INTEGER,
+          allowNull: true,
           defaultValue: 0,
         },
       },

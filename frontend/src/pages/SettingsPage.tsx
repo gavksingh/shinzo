@@ -1,7 +1,8 @@
-import React, { useState } from 'react'
+import React, { useState, useEffect } from 'react'
 import { useMutation, useQuery, useQueryClient } from 'react-query'
+import { useLocation } from 'react-router-dom'
 import { AppLayout } from '../components/layout/AppLayout'
-import { Button, TextField, Card, Flex, Text, Heading, Select, Box, Tabs, Switch } from '@radix-ui/themes'
+import { Button, TextField, Card, Flex, Text, Heading, Select, Box, Tabs, Switch, Badge, Dialog } from '@radix-ui/themes'
 import * as Icons from '@radix-ui/react-icons'
 import { API_BASE_URL } from '../config'
 import { useAuth } from '../contexts/AuthContext'
@@ -41,17 +42,46 @@ interface IngestToken {
   updated_at: string
 }
 
+interface RedactionRule {
+  uuid: string
+  rule_name: string
+  rule_type: 'regex' | 'field_name' | 'builtin'
+  pattern: string
+  replacement: string
+  is_enabled: boolean
+  is_builtin: boolean
+  target_fields: string[]
+  created_at: string
+  updated_at: string
+}
+
 export const SettingsPage: React.FC = () => {
   const auth = useAuth()
   const { token, user, logout } = auth
   const queryClient = useQueryClient()
+  const location = useLocation()
 
   const [activeTab, setActiveTab] = useState('profile')
+
+  // Support URL hash-based tab navigation (e.g., /settings#privacy)
+  useEffect(() => {
+    const hash = location.hash.replace('#', '')
+    if (hash && ['profile', 'accounts', 'tokens', 'privacy'].includes(hash)) {
+      setActiveTab(hash)
+    }
+  }, [location.hash])
   const [isChangingPassword, setIsChangingPassword] = useState(false)
   const [passwordForm, setPasswordForm] = useState({
     current_password: '',
     new_password: '',
     confirm_password: ''
+  })
+  const [showAddRule, setShowAddRule] = useState(false)
+  const [newRule, setNewRule] = useState({
+    rule_name: '',
+    pattern: '',
+    replacement: '[REDACTED]',
+    rule_type: 'regex' as 'regex' | 'field_name',
   })
 
   const { data: profile, isLoading: profileLoading } = useQuery(
@@ -95,6 +125,63 @@ export const SettingsPage: React.FC = () => {
       return ingestTokenService.fetchAll(token!)
     },
     { enabled: !!token }
+  )
+
+  // Redaction rules
+  const { data: redactionRules, isLoading: rulesLoading } = useQuery(
+    ['redactionRules'],
+    async () => {
+      const response = await fetch(`${API_BASE_URL}/spotlight/redaction-rules`, {
+        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      })
+      if (!response.ok) throw new Error('Failed to fetch redaction rules')
+      return response.json() as Promise<RedactionRule[]>
+    },
+    { enabled: !!token }
+  )
+
+  const toggleRuleMutation = useMutation(
+    async ({ ruleUuid, is_enabled }: { ruleUuid: string; is_enabled: boolean }) => {
+      const response = await fetch(`${API_BASE_URL}/spotlight/redaction-rules/${ruleUuid}`, {
+        method: 'PUT',
+        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ is_enabled }),
+      })
+      if (!response.ok) throw new Error('Failed to update rule')
+      return response.json()
+    },
+    { onSuccess: () => queryClient.invalidateQueries(['redactionRules']) }
+  )
+
+  const createRuleMutation = useMutation(
+    async (data: typeof newRule) => {
+      const response = await fetch(`${API_BASE_URL}/spotlight/redaction-rules`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      })
+      if (!response.ok) throw new Error('Failed to create rule')
+      return response.json()
+    },
+    {
+      onSuccess: () => {
+        queryClient.invalidateQueries(['redactionRules'])
+        setShowAddRule(false)
+        setNewRule({ rule_name: '', pattern: '', replacement: '[REDACTED]', rule_type: 'regex' })
+      }
+    }
+  )
+
+  const deleteRuleMutation = useMutation(
+    async (ruleUuid: string) => {
+      const response = await fetch(`${API_BASE_URL}/spotlight/redaction-rules/${ruleUuid}`, {
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      })
+      if (!response.ok) throw new Error('Failed to delete rule')
+      return response.json()
+    },
+    { onSuccess: () => queryClient.invalidateQueries(['redactionRules']) }
   )
 
   const { data: authMethods, isLoading: authMethodsLoading } = useQuery(
@@ -246,6 +333,10 @@ export const SettingsPage: React.FC = () => {
             <Tabs.Trigger value="tokens">
               <Icons.TokensIcon />
               Ingest Tokens
+            </Tabs.Trigger>
+            <Tabs.Trigger value="privacy">
+              <Icons.EyeNoneIcon />
+              Privacy & Redaction
             </Tabs.Trigger>
           </Tabs.List>
 
@@ -533,6 +624,172 @@ export const SettingsPage: React.FC = () => {
                 )}
               </Flex>
             </Card>
+          </Tabs.Content>
+
+          <Tabs.Content value="privacy">
+            <Flex direction="column" gap="6">
+              <Card>
+                <Flex direction="column" gap="4">
+                  <Flex justify="between" align="center">
+                    <Flex direction="column" gap="1">
+                      <Heading size="4">Privacy & Redaction Rules</Heading>
+                      <Text size="2" color="gray">
+                        Configure patterns to automatically redact sensitive data from session exports and shared sessions.
+                      </Text>
+                    </Flex>
+                    <Button onClick={() => setShowAddRule(true)}>
+                      <Icons.PlusIcon />
+                      Add Custom Rule
+                    </Button>
+                  </Flex>
+
+                  {rulesLoading ? (
+                    <Flex direction="column" gap="3">
+                      {[1, 2, 3].map(i => (
+                        <Box key={i} className="animate-pulse" style={{ padding: '16px', backgroundColor: 'var(--gray-2)', borderRadius: '8px' }}>
+                          <Box style={{ height: '16px', backgroundColor: 'var(--gray-3)', borderRadius: '4px', width: '50%' }} />
+                        </Box>
+                      ))}
+                    </Flex>
+                  ) : (
+                    <Flex direction="column" gap="3">
+                      {/* Built-in rules */}
+                      {redactionRules?.filter(r => r.is_builtin).map(rule => (
+                        <Card key={rule.uuid} style={{ border: rule.is_enabled ? '2px solid var(--green-9)' : '1px solid var(--gray-6)' }}>
+                          <Flex justify="between" align="center">
+                            <Flex align="center" gap="3" style={{ minWidth: 0, flex: 1 }}>
+                              <Box style={{ fontSize: '18px', flexShrink: 0 }}>🔒</Box>
+                              <Flex direction="column" gap="1" style={{ minWidth: 0, flex: 1 }}>
+                                <Flex align="center" gap="2" style={{ minHeight: '20px' }}>
+                                  <Text size="2" weight="medium">{rule.rule_name}</Text>
+                                  <Badge size="1" color="blue">Built-in</Badge>
+                                  <Box style={{ minWidth: '50px', display: 'inline-flex' }}>
+                                    {rule.is_enabled && <Badge size="1" color="green">Active</Badge>}
+                                  </Box>
+                                </Flex>
+                                <Text size="1" color="gray">Replaces with: {rule.replacement}</Text>
+                              </Flex>
+                            </Flex>
+                            <Switch
+                              checked={rule.is_enabled}
+                              onCheckedChange={(checked: boolean) => toggleRuleMutation.mutate({ ruleUuid: rule.uuid, is_enabled: checked })}
+                            />
+                          </Flex>
+                        </Card>
+                      ))}
+
+                      {/* Custom rules */}
+                      {redactionRules?.filter(r => !r.is_builtin).map(rule => (
+                        <Card key={rule.uuid} style={{ border: rule.is_enabled ? '2px solid var(--purple-9)' : '1px solid var(--gray-6)' }}>
+                          <Flex justify="between" align="center">
+                            <Flex align="center" gap="3" style={{ minWidth: 0, flex: 1 }}>
+                              <Box style={{ fontSize: '18px', flexShrink: 0 }}>✏️</Box>
+                              <Flex direction="column" gap="1" style={{ minWidth: 0, flex: 1 }}>
+                                <Flex align="center" gap="2" style={{ minHeight: '20px' }}>
+                                  <Text size="2" weight="medium">{rule.rule_name}</Text>
+                                  <Badge size="1" color="purple">Custom</Badge>
+                                  <Box style={{ minWidth: '50px', display: 'inline-flex' }}>
+                                    {rule.is_enabled && <Badge size="1" color="green">Active</Badge>}
+                                  </Box>
+                                </Flex>
+                                <Text size="1" color="gray">Replaces with: {rule.replacement}</Text>
+                              </Flex>
+                            </Flex>
+                            <Flex align="center" gap="3">
+                              <Switch
+                                checked={rule.is_enabled}
+                                onCheckedChange={(checked: boolean) => toggleRuleMutation.mutate({ ruleUuid: rule.uuid, is_enabled: checked })}
+                              />
+                              <Button
+                                size="1"
+                                color="red"
+                                variant="ghost"
+                                onClick={() => deleteRuleMutation.mutate(rule.uuid)}
+                              >
+                                <Icons.TrashIcon />
+                              </Button>
+                            </Flex>
+                          </Flex>
+                        </Card>
+                      ))}
+
+                      {(!redactionRules || redactionRules.length === 0) && (
+                        <Box style={{ textAlign: 'center', padding: '32px' }}>
+                          <Text size="3" color="gray">No redaction rules found</Text>
+                        </Box>
+                      )}
+                    </Flex>
+                  )}
+                </Flex>
+              </Card>
+
+              <Card>
+                <Flex direction="column" gap="3">
+                  <Heading size="4">How Redaction Works</Heading>
+                  <Text size="2" color="gray">
+                    • <strong>Exports:</strong> When "Apply Redaction" is enabled on export, all enabled rules will scan session data and replace matches.
+                  </Text>
+                  <Text size="2" color="gray">
+                    • <strong>Shared Sessions:</strong> Redaction rules are automatically applied to all shared session views.
+                  </Text>
+                  <Text size="2" color="gray">
+                    • <strong>Your View:</strong> Your own session detail page always shows raw data — redaction only affects exports and shares.
+                  </Text>
+                </Flex>
+              </Card>
+            </Flex>
+
+            {/* Add Custom Rule Dialog */}
+            <Dialog.Root open={showAddRule} onOpenChange={setShowAddRule}>
+              <Dialog.Content style={{ maxWidth: 500 }}>
+                <Dialog.Title>Add Custom Redaction Rule</Dialog.Title>
+                <Dialog.Description size="2" mb="4">
+                  Create a regex pattern to match and redact sensitive data in session exports.
+                </Dialog.Description>
+
+                <Flex direction="column" gap="3">
+                  <Flex direction="column" gap="1">
+                    <Text size="2" weight="medium">Rule Name</Text>
+                    <TextField.Root
+                      placeholder="e.g., Internal Project Names"
+                      value={newRule.rule_name}
+                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => setNewRule(prev => ({ ...prev, rule_name: e.target.value }))}
+                    />
+                  </Flex>
+
+                  <Flex direction="column" gap="1">
+                    <Text size="2" weight="medium">Regex Pattern</Text>
+                    <TextField.Root
+                      placeholder="e.g., secret_[a-zA-Z0-9]+"
+                      value={newRule.pattern}
+                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => setNewRule(prev => ({ ...prev, pattern: e.target.value }))}
+                      style={{ fontFamily: 'monospace' }}
+                    />
+                  </Flex>
+
+                  <Flex direction="column" gap="1">
+                    <Text size="2" weight="medium">Replacement Text</Text>
+                    <TextField.Root
+                      placeholder="e.g., [REDACTED]"
+                      value={newRule.replacement}
+                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => setNewRule(prev => ({ ...prev, replacement: e.target.value }))}
+                    />
+                  </Flex>
+                </Flex>
+
+                <Flex gap="3" mt="4" justify="end">
+                  <Dialog.Close>
+                    <Button variant="soft" color="gray">Cancel</Button>
+                  </Dialog.Close>
+                  <Button
+                    onClick={() => createRuleMutation.mutate(newRule)}
+                    disabled={!newRule.rule_name || !newRule.pattern || createRuleMutation.isLoading}
+                  >
+                    {createRuleMutation.isLoading ? 'Creating...' : 'Create Rule'}
+                  </Button>
+                </Flex>
+              </Dialog.Content>
+            </Dialog.Root>
           </Tabs.Content>
 
         </Tabs.Root>

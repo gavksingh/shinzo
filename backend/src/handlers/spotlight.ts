@@ -1,5 +1,8 @@
 import * as yup from 'yup'
-import { Session, Interaction, ToolUsage } from '../models'
+import { Session, Interaction, ToolUsage, RedactionRule } from '../models'
+import { getRedactionRules, applyRedaction, convertSessionToCSV, ensureBuiltinRules } from '../services/redactionService'
+import { createAuditLog, AuditActions } from '../services/auditLogService'
+import { generateCacheKey, getCache, setCache, CACHE_TTL } from '../services/cacheService'
 import { logger } from '../logger'
 import { Op } from 'sequelize'
 import axios from 'axios'
@@ -63,16 +66,44 @@ export const testProviderKeySchema = yup.object({
 }).required()
 
 export const fetchAnalyticsSchema = yup.object({
-  start_date: yup.date().optional(),
-  end_date: yup.date().optional(),
-  session_id: yup.string().optional(),
-  model: yup.string().optional(),
-  provider: yup.string().optional(),
-  // Pagination params
-  limit: yup.number().optional(),
-  offset: yup.number().optional(),
-  sort: yup.string().optional(),
-  sortDirection: yup.string().optional().oneOf(['asc', 'desc']),
+  start_date: yup.date()
+    .max(new Date(), 'Cannot query future dates')
+    .optional(),
+  end_date: yup.date()
+    .when('start_date', {
+      is: (val: any) => val !== undefined && val !== null,
+      then: (schema) => schema.min(yup.ref('start_date'), 'End date must be after start date'),
+      otherwise: (schema) => schema.optional()
+    })
+    .optional(),
+  session_id: yup.string()
+    .max(100, 'Session ID too long')
+    .trim()
+    .optional(),
+  model: yup.string()
+    .max(100, 'Model name too long')
+    .trim()
+    .optional(),
+  provider: yup.string()
+    .max(50, 'Provider name too long')
+    .trim()
+    .optional(),
+  limit: yup.number()
+    .integer('Limit must be an integer')
+    .min(1, 'Minimum 1 result')
+    .max(100, 'Maximum 100 results')
+    .optional(),
+  offset: yup.number()
+    .integer('Offset must be an integer')
+    .min(0, 'Offset cannot be negative')
+    .optional(),
+  sort: yup.string()
+    .max(50, 'Sort field too long')
+    .trim()
+    .optional(),
+  sortDirection: yup.string()
+    .oneOf(['asc', 'desc'], 'Invalid sort direction')
+    .optional(),
 }).optional()
 
 type FetchAnalyticsFilters = yup.InferType<typeof fetchAnalyticsSchema>
@@ -288,15 +319,15 @@ export const handleTestProviderKey = async (
 
     const testBody = request.provider === 'anthropic'
       ? {
-          model: 'claude-3-haiku-20240307',
-          max_tokens: 1,
-          messages: [{ role: 'user', content: 'test' }]
-        }
+        model: 'claude-3-haiku-20240307',
+        max_tokens: 1,
+        messages: [{ role: 'user', content: 'test' }]
+      }
       : {
-          model: 'gpt-3.5-turbo',
-          max_tokens: 1,
-          messages: [{ role: 'user', content: 'test' }]
-        }
+        model: 'gpt-3.5-turbo',
+        max_tokens: 1,
+        messages: [{ role: 'user', content: 'test' }]
+      }
 
     await axios.post(url, testBody, {
       headers: {
@@ -552,20 +583,22 @@ export const handleModelProxy = async (
         max_tokens, temperature, system_prompt, request_data, status, auth_type)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending', $12)
        RETURNING uuid`,
-      { bind: [
-        session.uuid,
-        userUuid,
-        providerKeyUuid,
-        apiKeyUuid,
-        requestTimestamp,
-        requestBody.model || 'unknown',
-        provider,
-        requestBody.max_tokens || null,
-        requestBody.temperature || null,
-        requestBody.system || null,
-        JSON.stringify(requestBody),
-        authType
-      ] })
+      {
+        bind: [
+          session.uuid,
+          userUuid,
+          providerKeyUuid,
+          apiKeyUuid,
+          requestTimestamp,
+          requestBody.model || 'unknown',
+          provider,
+          requestBody.max_tokens || null,
+          requestBody.temperature || null,
+          requestBody.system || null,
+          JSON.stringify(requestBody),
+          authType
+        ]
+      })
 
     const interaction = interactionResults[0] as any
 
@@ -609,19 +642,21 @@ export const handleModelProxy = async (
              cache_creation_ephemeral_1h_input_tokens = $8, cache_read_input_tokens = $9,
              response_data = $10, status = 'success', updated_at = CURRENT_TIMESTAMP
          WHERE uuid = $11`,
-        { bind: [
-          responseTimestamp,
-          providerResponse.data.id || null,
-          providerResponse.data.stop_reason || null,
-          latencyMs,
-          inputTokens,
-          outputTokens,
-          cacheCreation5m,
-          cacheCreation1h,
-          cacheReadTokens,
-          JSON.stringify(providerResponse.data),
-          interaction.uuid
-        ] })
+        {
+          bind: [
+            responseTimestamp,
+            providerResponse.data.id || null,
+            providerResponse.data.stop_reason || null,
+            latencyMs,
+            inputTokens,
+            outputTokens,
+            cacheCreation5m,
+            cacheCreation1h,
+            cacheReadTokens,
+            JSON.stringify(providerResponse.data),
+            interaction.uuid
+          ]
+        })
 
       await sequelize.query(
         `UPDATE spotlight.session
@@ -651,11 +686,13 @@ export const handleModelProxy = async (
         `UPDATE spotlight.interaction
          SET error_message = $1, error_type = $2, status = 'error', updated_at = CURRENT_TIMESTAMP
          WHERE uuid = $3`,
-        { bind: [
-          providerError.message,
-          providerError.response?.data?.error?.type || 'unknown',
-          interaction.uuid
-        ] })
+        {
+          bind: [
+            providerError.message,
+            providerError.response?.data?.error?.type || 'unknown',
+            interaction.uuid
+          ]
+        })
 
       return {
         response: {
@@ -705,53 +742,55 @@ async function handleStreamingRequest(
       usage: {}
     }
 
-    // Process the SSE stream
-    ;(async () => {
-      try {
-        for await (const event of parseSSEStream(providerResponse.data)) {
-          // Update accumulated message state
-          messageState = processSSEEvent(event, messageState)
+      // Process the SSE stream
+      ; (async () => {
+        try {
+          for await (const event of parseSSEStream(providerResponse.data)) {
+            // Update accumulated message state
+            messageState = processSSEEvent(event, messageState)
 
-          // Proxy the event to the client (re-serialize the parsed data)
-          const eventString = `event: ${event.event}\ndata: ${JSON.stringify(event.data)}\n\n`
-          clientStream.write(eventString)
-        }
+            // Proxy the event to the client (re-serialize the parsed data)
+            const eventString = `event: ${event.event}\ndata: ${JSON.stringify(event.data)}\n\n`
+            clientStream.write(eventString)
+          }
 
-        // Stream complete - save to database
-        const responseTimestamp = new Date()
-        const latencyMs = responseTimestamp.getTime() - requestTimestamp.getTime()
+          // Stream complete - save to database
+          const responseTimestamp = new Date()
+          const latencyMs = responseTimestamp.getTime() - requestTimestamp.getTime()
 
-        const usage = messageState.usage || {}
-        const inputTokens = usage.input_tokens || 0
-        const outputTokens = usage.output_tokens || 0
-        const cacheCreation = usage.cache_creation || {}
-        const cacheCreation5m = cacheCreation.ephemeral_5m_input_tokens || 0
-        const cacheCreation1h = cacheCreation.ephemeral_1h_input_tokens || 0
-        const cacheReadTokens = usage.cache_read_input_tokens || 0
+          const usage = messageState.usage || {}
+          const inputTokens = usage.input_tokens || 0
+          const outputTokens = usage.output_tokens || 0
+          const cacheCreation = usage.cache_creation || {}
+          const cacheCreation5m = cacheCreation.ephemeral_5m_input_tokens || 0
+          const cacheCreation1h = cacheCreation.ephemeral_1h_input_tokens || 0
+          const cacheReadTokens = usage.cache_read_input_tokens || 0
 
-        await sequelize.query(
-          `UPDATE spotlight.interaction
+          await sequelize.query(
+            `UPDATE spotlight.interaction
            SET response_timestamp = $1, response_id = $2, stop_reason = $3, latency_ms = $4,
                input_tokens = $5, output_tokens = $6, cache_creation_ephemeral_5m_input_tokens = $7,
                cache_creation_ephemeral_1h_input_tokens = $8, cache_read_input_tokens = $9,
                response_data = $10, status = 'success', updated_at = CURRENT_TIMESTAMP
            WHERE uuid = $11`,
-          { bind: [
-            responseTimestamp,
-            messageState.id || null,
-            messageState.stop_reason || null,
-            latencyMs,
-            inputTokens,
-            outputTokens,
-            cacheCreation5m,
-            cacheCreation1h,
-            cacheReadTokens,
-            JSON.stringify(messageState),
-            interaction.uuid
-          ] })
+            {
+              bind: [
+                responseTimestamp,
+                messageState.id || null,
+                messageState.stop_reason || null,
+                latencyMs,
+                inputTokens,
+                outputTokens,
+                cacheCreation5m,
+                cacheCreation1h,
+                cacheReadTokens,
+                JSON.stringify(messageState),
+                interaction.uuid
+              ]
+            })
 
-        await sequelize.query(
-          `UPDATE spotlight.session
+          await sequelize.query(
+            `UPDATE spotlight.session
            SET total_requests = total_requests + 1,
                total_input_tokens = total_input_tokens + $1,
                total_output_tokens = total_output_tokens + $2,
@@ -759,36 +798,38 @@ async function handleStreamingRequest(
                total_cache_creation_ephemeral_1h_input_tokens = total_cache_creation_ephemeral_1h_input_tokens + $4,
                updated_at = CURRENT_TIMESTAMP
            WHERE uuid = $5`,
-          { bind: [inputTokens, outputTokens, cacheCreation5m, cacheCreation1h, session.uuid] })
+            { bind: [inputTokens, outputTokens, cacheCreation5m, cacheCreation1h, session.uuid] })
 
-        logger.info({
-          message: 'Streaming response completed',
-          interactionUuid: interaction.uuid,
-          messageId: messageState.id
-        })
+          logger.info({
+            message: 'Streaming response completed',
+            interactionUuid: interaction.uuid,
+            messageId: messageState.id
+          })
 
-        clientStream.end()
-      } catch (streamError: any) {
-        logger.error({
-          message: 'Error processing SSE stream',
-          error: streamError,
-          provider,
-          userUuid
-        })
+          clientStream.end()
+        } catch (streamError: any) {
+          logger.error({
+            message: 'Error processing SSE stream',
+            error: streamError,
+            provider,
+            userUuid
+          })
 
-        await sequelize.query(
-          `UPDATE spotlight.interaction
+          await sequelize.query(
+            `UPDATE spotlight.interaction
            SET error_message = $1, error_type = $2, status = 'error', updated_at = CURRENT_TIMESTAMP
            WHERE uuid = $3`,
-          { bind: [
-            streamError.message,
-            'stream_processing_error',
-            interaction.uuid
-          ] })
+            {
+              bind: [
+                streamError.message,
+                'stream_processing_error',
+                interaction.uuid
+              ]
+            })
 
-        clientStream.destroy(streamError)
-      }
-    })()
+          clientStream.destroy(streamError)
+        }
+      })()
 
     return {
       stream: clientStream,
@@ -808,11 +849,13 @@ async function handleStreamingRequest(
       `UPDATE spotlight.interaction
        SET error_message = $1, error_type = $2, status = 'error', updated_at = CURRENT_TIMESTAMP
        WHERE uuid = $3`,
-      { bind: [
-        error.message,
-        error.response?.data?.error?.type || 'unknown',
-        interaction.uuid
-      ] })
+      {
+        bind: [
+          error.message,
+          error.response?.data?.error?.type || 'unknown',
+          interaction.uuid
+        ]
+      })
 
     return {
       response: {
@@ -852,19 +895,21 @@ export const handleCountTokens = async (
         has_system_prompt, has_tools, message_count, request_data, status, auth_type)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', $11)
        RETURNING uuid`,
-      { bind: [
-        userUuid,
-        providerKeyUuid,
-        apiKeyUuid,
-        requestTimestamp,
-        requestBody.model || 'unknown',
-        provider,
-        hasSystemPrompt,
-        hasTools,
-        messageCount,
-        JSON.stringify(requestBody),
-        authType
-      ] })
+      {
+        bind: [
+          userUuid,
+          providerKeyUuid,
+          apiKeyUuid,
+          requestTimestamp,
+          requestBody.model || 'unknown',
+          provider,
+          hasSystemPrompt,
+          hasTools,
+          messageCount,
+          JSON.stringify(requestBody),
+          authType
+        ]
+      })
 
     const tokenCountRequest = tokenCountResults[0] as any
 
@@ -887,13 +932,15 @@ export const handleCountTokens = async (
          SET response_timestamp = $1, latency_ms = $2, input_tokens = $3,
              response_data = $4, status = 'success', updated_at = CURRENT_TIMESTAMP
          WHERE uuid = $5`,
-        { bind: [
-          responseTimestamp,
-          latencyMs,
-          inputTokens,
-          JSON.stringify(providerResponse.data),
-          tokenCountRequest.uuid
-        ] }
+        {
+          bind: [
+            responseTimestamp,
+            latencyMs,
+            inputTokens,
+            JSON.stringify(providerResponse.data),
+            tokenCountRequest.uuid
+          ]
+        }
       )
 
       return {
@@ -917,11 +964,13 @@ export const handleCountTokens = async (
         `UPDATE spotlight.token_count_request
          SET error_message = $1, error_type = $2, status = 'error', updated_at = CURRENT_TIMESTAMP
          WHERE uuid = $3`,
-        { bind: [
-          providerError.message,
-          providerError.response?.data?.error?.type || 'unknown',
-          tokenCountRequest.uuid
-        ] })
+        {
+          bind: [
+            providerError.message,
+            providerError.response?.data?.error?.type || 'unknown',
+            tokenCountRequest.uuid
+          ]
+        })
 
       return {
         response: {
@@ -1003,7 +1052,7 @@ export const handleFetchTokenAnalytics = async (
   filters: FetchAnalyticsFilters = {}
 ) => {
   try {
-    const where: any = { user_uuid: userUuid, status: 'success' }
+    const where: any = { userUuid: userUuid, status: 'success' }
 
     if (filters.start_date) {
       where.request_timestamp = { ...where.request_timestamp, [Op.gte]: filters.start_date }
@@ -1213,7 +1262,7 @@ export const handleFetchSessionDetail = async (userUuid: string, sessionUuid: st
     logger.debug({ message: 'Fetching session detail', userUuid, sessionUuid })
 
     const session = await Session.findOne({
-      where: { uuid: sessionUuid, user_uuid: userUuid },
+      where: { uuid: sessionUuid, userUuid: userUuid },
       include: [
         {
           model: Interaction,
@@ -1427,7 +1476,7 @@ export const handleCreateSessionShare = async (userUuid: string, sessionUuid: st
   try {
     // Verify session exists and belongs to user
     const session = await Session.findOne({
-      where: { uuid: sessionUuid, user_uuid: userUuid }
+      where: { uuid: sessionUuid, userUuid: userUuid }
     })
 
     if (!session) {
@@ -1478,6 +1527,15 @@ export const handleCreateSessionShare = async (userUuid: string, sessionUuid: st
 
     logger.info({ message: 'Session share created', userUuid, sessionUuid, shareUuid: newShare.uuid })
 
+    // Audit log the share creation
+    await createAuditLog({
+      userUuid: userUuid,
+      action: AuditActions.SESSION_SHARE_CREATE,
+      resourceType: 'session',
+      resourceUuid: sessionUuid,
+      metadata: { share_uuid: newShare.uuid, share_token: newShare.share_token }
+    })
+
     return {
       response: {
         share_token: newShare.share_token,
@@ -1500,7 +1558,7 @@ export const handleDeleteSessionShare = async (userUuid: string, sessionUuid: st
   try {
     // Verify session exists and belongs to user
     const session = await Session.findOne({
-      where: { uuid: sessionUuid, user_uuid: userUuid }
+      where: { uuid: sessionUuid, userUuid: userUuid }
     })
 
     if (!session) {
@@ -1528,7 +1586,18 @@ export const handleDeleteSessionShare = async (userUuid: string, sessionUuid: st
       }
     }
 
+    const shareUuid = (results as any)[0].uuid
+
     logger.info({ message: 'Session share deactivated', userUuid, sessionUuid })
+
+    // Audit log the share deletion
+    await createAuditLog({
+      userUuid: userUuid,
+      action: AuditActions.SESSION_SHARE_DELETE,
+      resourceType: 'session',
+      resourceUuid: sessionUuid,
+      metadata: { share_uuid: shareUuid }
+    })
 
     return {
       response: { message: 'Session share deactivated' },
@@ -1548,7 +1617,7 @@ export const handleGetSessionShareStatus = async (userUuid: string, sessionUuid:
   try {
     // Verify session exists and belongs to user
     const session = await Session.findOne({
-      where: { uuid: sessionUuid, user_uuid: userUuid }
+      where: { uuid: sessionUuid, userUuid: userUuid }
     })
 
     if (!session) {
@@ -1687,8 +1756,15 @@ export const handleFetchSharedSessionDetail = async (shareToken: string) => {
       is_shared: true
     }
 
+    // Apply redaction rules from the session owner for shared sessions
+    const rules = await getRedactionRules(session.user_uuid)
+    let finalResponse: any = response
+    if (rules.length > 0) {
+      finalResponse = applyRedaction(response, rules.map(r => r.toJSON()))
+    }
+
     return {
-      response,
+      response: finalResponse,
       status: 200
     }
   } catch (error) {
@@ -1698,6 +1774,632 @@ export const handleFetchSharedSessionDetail = async (shareToken: string) => {
       error: true,
       status: 500
     }
+  }
+}
+
+// ============================================================================
+// Session Replay Features
+// ============================================================================
+
+export const searchSessionsSchema = yup.object({
+  start_date: yup.date()
+    .max(new Date(), 'Cannot search future dates')
+    .optional(),
+  end_date: yup.date()
+    .when('start_date', {
+      is: (val: any) => val !== undefined && val !== null,
+      then: (schema) => schema.min(yup.ref('start_date'), 'End date must be after start date'),
+      otherwise: (schema) => schema.optional()
+    })
+    .optional(),
+  error_type: yup.string()
+    .max(100, 'Error type too long')
+    .trim()
+    .optional(),
+  has_errors: yup.boolean().optional(),
+  session_id: yup.string()
+    .max(100, 'Session ID too long')
+    .trim()
+    .optional(),
+  model: yup.string()
+    .max(100, 'Model name too long')
+    .trim()
+    .optional(),
+  provider: yup.string()
+    .max(50, 'Provider name too long')
+    .trim()
+    .optional(),
+  limit: yup.number()
+    .integer('Limit must be an integer')
+    .min(1, 'Minimum 1 result')
+    .max(100, 'Maximum 100 results per request')
+    .default(25),
+  offset: yup.number()
+    .integer('Offset must be an integer')
+    .min(0, 'Offset cannot be negative')
+    .default(0),
+  sort: yup.string()
+    .oneOf(
+      ['start_time', 'end_time', 'total_requests', 'session_id', 'error_count'],
+      'Invalid sort column'
+    )
+    .default('start_time'),
+  sortDirection: yup.string()
+    .oneOf(['asc', 'desc'], 'Invalid sort direction')
+    .default('desc')
+}).optional()
+
+export const handleSearchSessions = async (
+  userUuid: string,
+  filters?: yup.InferType<typeof searchSessionsSchema>
+) => {
+  try {
+    logger.debug({ message: 'Searching sessions', userUuid, filters })
+
+    // Generate cache key based on filters
+    const cacheKey = generateCacheKey('search', userUuid, filters)
+
+    // Try cache first
+    const cached = await getCache<any>(cacheKey)
+    if (cached) {
+      logger.debug({ message: 'Cache hit for session search', userUuid })
+      return { response: cached, status: 200 }
+    }
+
+    // Cache miss - query database
+    logger.debug({ message: 'Cache miss for session search', userUuid })
+
+    const whereClause: any = { userUuid: userUuid }
+
+    // Date range filters
+    if (filters?.start_date) {
+      whereClause.start_time = { [Op.gte]: filters.start_date }
+    }
+    if (filters?.end_date) {
+      whereClause.start_time = {
+        ...whereClause.start_time,
+        [Op.lte]: filters.end_date
+      }
+    }
+
+    // Error count filter
+    if (filters?.has_errors) {
+      whereClause.error_count = { [Op.gt]: 0 }
+    }
+
+    // Session ID filter (partial match)
+    if (filters?.session_id) {
+      whereClause.session_id = { [Op.iLike]: `%${filters.session_id}%` }
+    }
+
+    // Build include clause for model/provider/error_type filtering
+    const includeInteractions = filters?.model || filters?.provider || filters?.error_type
+    const interactionWhere: any = {}
+
+    if (filters?.model) {
+      interactionWhere.model = filters.model
+    }
+    if (filters?.provider) {
+      interactionWhere.provider = filters.provider
+    }
+    if (filters?.error_type) {
+      interactionWhere.error_type = filters.error_type
+    }
+
+    // Validate sort column to prevent SQL injection
+    const validSortColumns = ['start_time', 'end_time', 'total_requests', 'session_id', 'error_count']
+    const safeSort = validSortColumns.includes(filters?.sort || 'start_time') ? (filters?.sort || 'start_time') : 'start_time'
+    const safeSortDirection = (filters?.sortDirection || 'desc') === 'asc' ? 'ASC' : 'DESC'
+
+    // Fetch sessions with pagination
+    const sessions = await Session.findAndCountAll({
+      where: whereClause,
+      include: includeInteractions
+        ? [{
+          model: Interaction,
+          as: 'interactions',
+          where: interactionWhere,
+          required: true,
+          attributes: [] // Don't fetch interaction details, just use for filtering
+        }]
+        : undefined,
+      limit: filters?.limit || 25,
+      offset: filters?.offset || 0,
+      order: [[safeSort, safeSortDirection]],
+      distinct: true // Needed when using include with hasMany
+    })
+
+    const result = {
+      sessions: sessions.rows,
+      total: sessions.count,
+      limit: filters?.limit || 25,
+      offset: filters?.offset || 0,
+    }
+
+    // Store in cache with 5 minute TTL
+    await setCache(cacheKey, result, CACHE_TTL.SEARCH)
+
+    return {
+      response: result,
+      status: 200
+    }
+  } catch (error) {
+    logger.error({ message: 'Error searching sessions', error, userUuid, filters })
+    return {
+      response: 'Error searching sessions',
+      error: true,
+      status: 500
+    }
+  }
+}
+
+export const exportSessionSchema = yup.object({
+  format: yup.string()
+    .oneOf(['json', 'csv'], 'Invalid export format')
+    .default('json'),
+  apply_redaction: yup.boolean()
+    .default(false),
+  include_metadata: yup.boolean()
+    .default(true)
+}).optional()
+
+export const handleExportSession = async (
+  userUuid: string,
+  sessionUuid: string,
+  options?: yup.InferType<typeof exportSessionSchema>
+) => {
+  try {
+    logger.debug({ message: 'Exporting session', userUuid, sessionUuid, options })
+
+    // Fetch complete session with all related data
+    const session = await Session.findOne({
+      where: { uuid: sessionUuid, userUuid: userUuid },
+      include: [
+        {
+          model: Interaction,
+          as: 'interactions',
+          include: [
+            { model: ToolUsage, as: 'toolUsages' }
+          ]
+        }
+      ]
+    })
+
+    if (!session) {
+      return {
+        response: 'Session not found',
+        error: true,
+        status: 404
+      }
+    }
+
+    let exportData = session.toJSON()
+
+    // Apply redaction if requested
+    if (options?.apply_redaction) {
+      const rules = await getRedactionRules(userUuid)
+      if (rules.length > 0) {
+        exportData = applyRedaction(exportData, rules.map(r => r.toJSON()))
+      }
+    }
+
+    if (options?.format === 'csv') {
+      const csvContent = convertSessionToCSV(exportData)
+
+      // Audit log the export
+      await createAuditLog({
+        userUuid: userUuid,
+        action: AuditActions.SESSION_EXPORT,
+        resourceType: 'session',
+        resourceUuid: sessionUuid,
+        metadata: { format: 'csv', apply_redaction: options?.apply_redaction || false }
+      })
+
+      return {
+        response: csvContent,
+        status: 200
+      }
+    }
+
+    // Audit log the export
+    await createAuditLog({
+      userUuid: userUuid,
+      action: AuditActions.SESSION_EXPORT,
+      resourceType: 'session',
+      resourceUuid: sessionUuid,
+      metadata: { format: 'json', apply_redaction: options?.apply_redaction || false }
+    })
+
+    return {
+      response: exportData,
+      status: 200
+    }
+  } catch (error) {
+    logger.error({ message: 'Error exporting session', error, userUuid, sessionUuid })
+    return {
+      response: 'Error exporting session',
+      error: true,
+      status: 500
+    }
+  }
+}
+
+// ============================================================================
+// Session Analytics Summary & Time Series
+// ============================================================================
+
+export const analyticsTimeSeriesSchema = yup.object({
+  days: yup.number().min(1).max(90).default(30),
+}).optional()
+
+export const handleSessionAnalyticsSummary = async (userUuid: string) => {
+  try {
+    logger.debug({ message: 'Fetching session analytics summary', userUuid })
+
+    // Generate cache key
+    const cacheKey = generateCacheKey('summary', userUuid)
+
+    // Try cache first
+    const cached = await getCache<any>(cacheKey)
+    if (cached) {
+      logger.debug({ message: 'Cache hit for analytics summary', userUuid })
+      return { response: cached, status: 200 }
+    }
+
+    // Cache miss - query database
+    logger.debug({ message: 'Cache miss for analytics summary', userUuid })
+
+    // Total sessions + error sessions + average duration
+    const [summaryResults] = await sequelize.query(`
+      SELECT
+        COUNT(*)::int AS total_sessions,
+        COUNT(CASE WHEN error_count > 0 THEN 1 END)::int AS error_sessions,
+        ROUND(AVG(EXTRACT(EPOCH FROM (end_time - start_time)))::numeric, 1) AS avg_duration_seconds,
+        COALESCE(SUM(total_requests), 0)::int AS total_interactions
+      FROM spotlight.session
+      WHERE user_uuid = :userUuid
+    `, { replacements: { userUuid } })
+
+    // Sessions in last 24h, 7d, 30d
+    const [trendResults] = await sequelize.query(`
+      SELECT
+        COUNT(CASE WHEN start_time >= NOW() - INTERVAL '24 hours' THEN 1 END)::int AS sessions_24h,
+        COUNT(CASE WHEN start_time >= NOW() - INTERVAL '7 days' THEN 1 END)::int AS sessions_7d,
+        COUNT(CASE WHEN start_time >= NOW() - INTERVAL '30 days' THEN 1 END)::int AS sessions_30d
+      FROM spotlight.session
+      WHERE user_uuid = :userUuid
+    `, { replacements: { userUuid } })
+
+    // Top models by usage
+    const [modelResults] = await sequelize.query(`
+      SELECT
+        i.model,
+        COUNT(*)::int AS usage_count,
+        COUNT(DISTINCT i.session_uuid)::int AS session_count
+      FROM spotlight.interaction i
+      JOIN spotlight.session s ON s.uuid = i.session_uuid
+      WHERE s.user_uuid = :userUuid
+        AND i.model IS NOT NULL
+      GROUP BY i.model
+      ORDER BY usage_count DESC
+      LIMIT 5
+    `, { replacements: { userUuid } })
+
+    // Top providers
+    const [providerResults] = await sequelize.query(`
+      SELECT
+        i.provider,
+        COUNT(*)::int AS usage_count
+      FROM spotlight.interaction i
+      JOIN spotlight.session s ON s.uuid = i.session_uuid
+      WHERE s.user_uuid = :userUuid
+        AND i.provider IS NOT NULL
+      GROUP BY i.provider
+      ORDER BY usage_count DESC
+      LIMIT 5
+    `, { replacements: { userUuid } })
+
+    const summary = (summaryResults as any[])[0] || {}
+    const trends = (trendResults as any[])[0] || {}
+    const errorRate = summary.total_sessions > 0
+      ? Math.round((summary.error_sessions / summary.total_sessions) * 100)
+      : 0
+
+    const result = {
+      total_sessions: summary.total_sessions || 0,
+      error_sessions: summary.error_sessions || 0,
+      error_rate: errorRate,
+      avg_duration_seconds: parseFloat(summary.avg_duration_seconds) || 0,
+      total_interactions: summary.total_interactions || 0,
+      sessions_24h: trends.sessions_24h || 0,
+      sessions_7d: trends.sessions_7d || 0,
+      sessions_30d: trends.sessions_30d || 0,
+      top_models: modelResults || [],
+      top_providers: providerResults || [],
+    }
+
+    // Store in cache with 10 minute TTL
+    await setCache(cacheKey, result, CACHE_TTL.SUMMARY)
+
+    return {
+      response: result,
+      status: 200
+    }
+  } catch (error) {
+    logger.error({ message: 'Error fetching session analytics summary', error, userUuid })
+    return { response: 'Error fetching session analytics summary', error: true, status: 500 }
+  }
+}
+
+export const handleSessionAnalyticsTimeSeries = async (
+  userUuid: string,
+  options?: yup.InferType<typeof analyticsTimeSeriesSchema>
+) => {
+  try {
+    const days = options?.days || 30
+    logger.debug({ message: 'Fetching session analytics time series', userUuid, days })
+
+    // Daily session counts + error counts
+    const [dailyResults] = await sequelize.query(`
+      SELECT
+        d.date::text AS date,
+        COALESCE(counts.session_count, 0)::int AS session_count,
+        COALESCE(counts.error_count, 0)::int AS error_count,
+        COALESCE(counts.interaction_count, 0)::int AS interaction_count
+      FROM generate_series(
+        (NOW() - INTERVAL '1 day' * :days)::date,
+        NOW()::date,
+        '1 day'::interval
+      ) AS d(date)
+      LEFT JOIN (
+        SELECT
+          start_time::date AS day,
+          COUNT(*)::int AS session_count,
+          COUNT(CASE WHEN error_count > 0 THEN 1 END)::int AS error_count,
+          COALESCE(SUM(total_requests), 0)::int AS interaction_count
+        FROM spotlight.session
+        WHERE user_uuid = :userUuid
+          AND start_time >= NOW() - INTERVAL '1 day' * :days
+        GROUP BY start_time::date
+      ) counts ON counts.day = d.date::date
+      ORDER BY d.date ASC
+    `, { replacements: { userUuid, days } })
+
+    // Model usage breakdown for the period
+    const [modelBreakdown] = await sequelize.query(`
+      SELECT
+        i.model,
+        COUNT(*)::int AS usage_count,
+        COALESCE(SUM(i.input_tokens), 0)::bigint AS total_input_tokens,
+        COALESCE(SUM(i.output_tokens), 0)::bigint AS total_output_tokens
+      FROM spotlight.interaction i
+      JOIN spotlight.session s ON s.uuid = i.session_uuid
+      WHERE s.user_uuid = :userUuid
+        AND i.request_timestamp >= NOW() - INTERVAL '1 day' * :days
+        AND i.model IS NOT NULL
+      GROUP BY i.model
+      ORDER BY usage_count DESC
+    `, { replacements: { userUuid, days } })
+
+    return {
+      response: {
+        days,
+        daily: dailyResults || [],
+        model_breakdown: modelBreakdown || [],
+      },
+      status: 200
+    }
+  } catch (error) {
+    logger.error({ message: 'Error fetching session analytics time series', error, userUuid })
+    return { response: 'Error fetching session analytics time series', error: true, status: 500 }
+  }
+}
+
+// ============================================================================
+// Redaction Rule CRUD Operations
+// ============================================================================
+
+export const createRedactionRuleSchema = yup.object({
+  rule_name: yup.string()
+    .required('Rule name is required')
+    .min(3, 'Rule name must be at least 3 characters')
+    .max(100, 'Rule name too long')
+    .matches(/^[a-zA-Z0-9\s\-_]+$/, 'Only alphanumeric characters, spaces, hyphens, and underscores allowed')
+    .trim(),
+  rule_type: yup.string()
+    .oneOf(['regex', 'field_name'], 'Invalid rule type')
+    .required('Rule type is required'),
+  pattern: yup.string()
+    .required('Pattern is required')
+    .max(500, 'Pattern too long'),
+  replacement: yup.string()
+    .max(100, 'Replacement text too long')
+    .default('[REDACTED]'),
+  is_enabled: yup.boolean()
+    .default(true),
+  target_fields: yup.array()
+    .of(yup.string()
+      .oneOf(
+        ['request_data', 'response_data', 'tool_input', 'tool_output', 'system_prompt', 'environment', 'metadata'],
+        'Invalid target field'
+      )
+      .required())
+    .min(1, 'At least one target field required')
+    .default(['request_data', 'response_data', 'tool_input', 'tool_output', 'system_prompt']),
+}).required()
+
+export const updateRedactionRuleSchema = yup.object({
+  rule_name: yup.string()
+    .min(3, 'Rule name must be at least 3 characters')
+    .max(100, 'Rule name too long')
+    .matches(/^[a-zA-Z0-9\s\-_]+$/, 'Only alphanumeric characters, spaces, hyphens, and underscores allowed')
+    .trim()
+    .optional(),
+  pattern: yup.string()
+    .max(500, 'Pattern too long')
+    .optional(),
+  replacement: yup.string()
+    .max(100, 'Replacement text too long')
+    .optional(),
+  is_enabled: yup.boolean()
+    .optional(),
+  target_fields: yup.array()
+    .of(yup.string()
+      .oneOf(
+        ['request_data', 'response_data', 'tool_input', 'tool_output', 'system_prompt', 'environment', 'metadata'],
+        'Invalid target field'
+      )
+      .required())
+    .min(1, 'At least one target field required')
+    .optional(),
+}).required()
+
+export const handleFetchRedactionRules = async (userUuid: string) => {
+  try {
+    await ensureBuiltinRules(userUuid)
+    const rules = await RedactionRule.findAll({
+      where: { userUuid: userUuid },
+      order: [['is_builtin', 'DESC'], ['created_at', 'ASC']],
+    })
+    return { response: rules, status: 200 }
+  } catch (error) {
+    logger.error({ message: 'Error fetching redaction rules', error, userUuid })
+    return { response: 'Error fetching redaction rules', error: true, status: 500 }
+  }
+}
+
+export const handleCreateRedactionRule = async (
+  userUuid: string,
+  data: yup.InferType<typeof createRedactionRuleSchema>
+) => {
+  try {
+    // Validate regex pattern
+    if (data.rule_type === 'regex') {
+      try {
+        new RegExp(data.pattern)
+      } catch (e) {
+        return { response: 'Invalid regex pattern', error: true, status: 400 }
+      }
+    }
+
+    const rule = await RedactionRule.create({
+      userUuid: userUuid,
+      rule_name: data.rule_name,
+      rule_type: data.rule_type,
+      pattern: data.pattern,
+      replacement: data.replacement || '[REDACTED]',
+      is_enabled: data.is_enabled ?? true,
+      is_builtin: false,
+      target_fields: data.target_fields || ['request_data', 'response_data', 'tool_input', 'tool_output', 'system_prompt'],
+    })
+
+    // Audit log the rule creation
+    await createAuditLog({
+      userUuid: userUuid,
+      action: AuditActions.REDACTION_RULE_CREATE,
+      resourceType: 'redaction_rule',
+      resourceUuid: rule.uuid,
+      metadata: { rule_name: rule.rule_name, rule_type: rule.rule_type }
+    })
+
+    return { response: rule, status: 201 }
+  } catch (error) {
+    logger.error({ message: 'Error creating redaction rule', error, userUuid })
+    return { response: 'Error creating redaction rule', error: true, status: 500 }
+  }
+}
+
+export const handleUpdateRedactionRule = async (
+  userUuid: string,
+  ruleUuid: string,
+  data: yup.InferType<typeof updateRedactionRuleSchema>
+) => {
+  try {
+    const rule = await RedactionRule.findOne({
+      where: { uuid: ruleUuid, userUuid: userUuid }
+    })
+
+    if (!rule) {
+      return { response: 'Redaction rule not found', error: true, status: 404 }
+    }
+
+    // For built-in rules, only allow toggling is_enabled
+    if (rule.is_builtin) {
+      await rule.update({
+        is_enabled: data.is_enabled ?? rule.is_enabled,
+        updated_at: new Date(),
+      })
+    } else {
+      // Validate regex if pattern changes
+      if (data.pattern && rule.rule_type === 'regex') {
+        try {
+          new RegExp(data.pattern)
+        } catch (e) {
+          return { response: 'Invalid regex pattern', error: true, status: 400 }
+        }
+      }
+
+      await rule.update({
+        rule_name: data.rule_name ?? rule.rule_name,
+        pattern: data.pattern ?? rule.pattern,
+        replacement: data.replacement ?? rule.replacement,
+        is_enabled: data.is_enabled ?? rule.is_enabled,
+        target_fields: data.target_fields ?? rule.target_fields,
+        updated_at: new Date(),
+      })
+    }
+
+    // Audit log the rule update
+    await createAuditLog({
+      userUuid: userUuid,
+      action: AuditActions.REDACTION_RULE_UPDATE,
+      resourceType: 'redaction_rule',
+      resourceUuid: rule.uuid,
+      metadata: {
+        rule_name: rule.rule_name,
+        changes: data,
+        is_builtin: rule.is_builtin
+      }
+    })
+
+    return { response: await rule.reload(), status: 200 }
+  } catch (error) {
+    logger.error({ message: 'Error updating redaction rule', error, userUuid, ruleUuid })
+    return { response: 'Error updating redaction rule', error: true, status: 500 }
+  }
+}
+
+export const handleDeleteRedactionRule = async (
+  userUuid: string,
+  ruleUuid: string
+) => {
+  try {
+    const rule = await RedactionRule.findOne({
+      where: { uuid: ruleUuid, userUuid: userUuid }
+    })
+
+    if (!rule) {
+      return { response: 'Redaction rule not found', error: true, status: 404 }
+    }
+
+    if (rule.is_builtin) {
+      return { response: 'Cannot delete built-in rules. You can disable them instead.', error: true, status: 403 }
+    }
+
+    // Audit log the rule deletion
+    await createAuditLog({
+      userUuid: userUuid,
+      action: AuditActions.REDACTION_RULE_DELETE,
+      resourceType: 'redaction_rule',
+      resourceUuid: rule.uuid,
+      metadata: { rule_name: rule.rule_name, rule_type: rule.rule_type }
+    })
+
+    await rule.destroy()
+    return { response: { message: 'Redaction rule deleted' }, status: 200 }
+  } catch (error) {
+    logger.error({ message: 'Error deleting redaction rule', error, userUuid, ruleUuid })
+    return { response: 'Error deleting redaction rule', error: true, status: 500 }
   }
 }
 

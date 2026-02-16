@@ -1,4 +1,5 @@
 import React from 'react'
+import { useNavigate } from 'react-router-dom'
 import { DropdownMenu, Avatar, Flex, Text, Button, IconButton } from '@radix-ui/themes'
 import * as Icons from '@radix-ui/react-icons'
 import { useAuth } from '../../contexts/AuthContext'
@@ -7,6 +8,7 @@ import { useMobileSidebar } from '../../contexts/MobileSidebarContext'
 export const Header: React.FC = () => {
   const { user, logout } = useAuth()
   const { toggleSidebar } = useMobileSidebar()
+  const navigate = useNavigate()
 
   const handleLogout = () => {
     logout()
@@ -102,6 +104,11 @@ export const Header: React.FC = () => {
           </DropdownMenu.Trigger>
           <DropdownMenu.Content align="end">
             <DropdownMenu.Label>{user?.email}</DropdownMenu.Label>
+            <DropdownMenu.Separator />
+            <DropdownMenu.Item onSelect={() => navigate('/settings')}>
+              <Icons.GearIcon />
+              Settings
+            </DropdownMenu.Item>
             <DropdownMenu.Separator />
             <DropdownMenu.Item color="red" onSelect={handleLogout}>
               <Icons.ExitIcon />

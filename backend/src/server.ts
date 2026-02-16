@@ -1,10 +1,21 @@
 import fastify, { FastifyReply, FastifyRequest } from 'fastify'
 import fastifyCors from '@fastify/cors'
 import fastifyRateLimit from '@fastify/rate-limit'
+import helmet from '@fastify/helmet'
+import csrf from '@fastify/csrf-protection'
+import compress from '@fastify/compress'
 import { PORT, RATE_LIMIT_WINDOW, RATE_LIMIT_MAX, MAX_PAYLOAD_SIZE, LOG_LEVEL } from './config'
 import { logger, pinoConfig } from './logger'
 import { sequelize, getPoolStats } from './dbClient'
 import { authenticateJWT, AuthenticatedRequest, authenticatedShinzoCredentials, getProviderCredentials, constructModelAPIResponseHeaders } from './middleware/auth'
+import {
+  sessionSearchRateLimiter,
+  sessionExportRateLimiter,
+  redactionRuleRateLimiter,
+  sharedSessionRateLimiter,
+  analyticsSummaryRateLimiter
+} from './middleware/rateLimiter'
+import { performanceMonitoring, getPerformanceStats, getEndpointStats, getSlowestRequests } from './middleware/performance'
 import { PassThrough } from 'stream'
 
 // Type guard for streaming responses
@@ -106,14 +117,30 @@ import {
   handleDeleteSessionShare,
   handleGetSessionShareStatus,
   handleFetchSharedSessionDetail,
+  // Session replay handlers
+  handleSearchSessions,
+  searchSessionsSchema,
+  handleExportSession,
+  exportSessionSchema,
+  // Session analytics summary & time series
+  handleSessionAnalyticsSummary,
+  handleSessionAnalyticsTimeSeries,
+  analyticsTimeSeriesSchema,
+  // Redaction rule handlers
+  handleFetchRedactionRules,
+  handleCreateRedactionRule,
+  createRedactionRuleSchema,
+  handleUpdateRedactionRule,
+  updateRedactionRuleSchema,
+  handleDeleteRedactionRule,
 } from './handlers/spotlight'
 
 logger.info('STARTUP: server.ts - All imports loaded, creating Fastify instance')
 
-// Create Fastify instance
+// Create Fastify instance with security configuration
 const app = fastify({
   logger: pinoConfig('backend'),
-  bodyLimit: parseInt(MAX_PAYLOAD_SIZE.replace('mb', '')) * 1024 * 1024,
+  bodyLimit: 1 * 1024 * 1024, // 1MB global limit to prevent DoS via large payloads
 })
 
 // Register plugins
@@ -127,7 +154,39 @@ app.register(fastifyRateLimit, {
   timeWindow: RATE_LIMIT_WINDOW
 })
 
+// Register security headers (helmet)
+await app.register(helmet, {
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      imgSrc: ["'self'", 'data:', 'https:'],
+      connectSrc: ["'self'"],
+      fontSrc: ["'self'"],
+      objectSrc: ["'none'"],
+      mediaSrc: ["'self'"],
+      frameSrc: ["'none'"],
+    },
+  },
+  xssFilter: true,
+  noSniff: true,
+  referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
+})
+
+// Register CSRF protection
+await app.register(csrf)
+
+// Register response compression (gzip/brotli)
+await app.register(compress, {
+  global: true,
+  encodings: ['gzip', 'deflate', 'br'],
+  threshold: 1024, // Only compress responses > 1KB
+})
+
 // Request logging hook for debug/trace level
+app.addHook('preHandler', performanceMonitoring)
+
 app.addHook('preHandler', async (request, reply) => {
   if (LOG_LEVEL === 'debug' || LOG_LEVEL === 'trace') {
     logger.debug({
@@ -211,6 +270,24 @@ app.get('/health/deep', async (request, reply) => {
       error: error.message
     })
   }
+})
+
+// Internal performance monitoring endpoints
+app.get('/internal/performance/stats', async (request, reply) => {
+  const stats = getPerformanceStats()
+  return reply.send(stats)
+})
+
+app.get('/internal/performance/endpoint/:pattern', async (request: FastifyRequest<{ Params: { pattern: string } }>, reply) => {
+  const { pattern } = request.params
+  const stats = getEndpointStats(pattern)
+  return reply.send(stats)
+})
+
+app.get('/internal/performance/slow', async (request: FastifyRequest<{ Querystring: { limit?: string } }>, reply) => {
+  const limit = request.query.limit ? parseInt(request.query.limit) : 10
+  const slow = getSlowestRequests(limit)
+  return reply.send({ slowest_requests: slow })
 })
 
 // Authentication endpoints
@@ -921,7 +998,7 @@ app.all('/spotlight/:provider/v1/*', async (request: FastifyRequest, reply: Fast
     const shinzoCredentials = await authenticatedShinzoCredentials(request)
     if (!shinzoCredentials.apiKey) {
       reply.status(401).send({ error: 'Shinzo API key authentication failed' })
-      return    
+      return
     }
 
     // Extract the endpoint path including /v1/ prefix
@@ -941,7 +1018,7 @@ app.all('/spotlight/:provider/v1/*', async (request: FastifyRequest, reply: Fast
     }
 
     if (provider === 'anthropic') {
-      switch(endpointPath) {
+      switch (endpointPath) {
         case modelAPISpec.anthropic.countTokens:
           result = await handleCountTokens(
             shinzoCredentials,
@@ -1117,13 +1194,171 @@ app.get('/spotlight/analytics/sessions/:sessionUuid/share', async (request: Auth
 })
 
 // Public shared session endpoint (no authentication required)
-app.get('/spotlight/analytics/sessions/shared/:shareToken', async (request: FastifyRequest, reply: FastifyReply) => {
+app.get('/spotlight/analytics/sessions/shared/:shareToken', {
+  preHandler: [sharedSessionRateLimiter]
+}, async (request: FastifyRequest, reply: FastifyReply) => {
   try {
     const { shareToken } = request.params as { shareToken: string }
     const result = await handleFetchSharedSessionDetail(shareToken)
     reply.status(result.status || 200).send(result.response)
   } catch (error: any) {
     logger.error({ message: 'Fetch shared session detail error', error })
+    reply.status(500).send({ error: 'Internal server error' })
+  }
+})
+
+// Session Replay: Search sessions with advanced filters
+app.get('/spotlight/analytics/sessions/search', {
+  preHandler: [sessionSearchRateLimiter]
+}, async (request: AuthenticatedRequest, reply: FastifyReply) => {
+  const authenticated = await authenticateJWT(request, reply)
+  if (!authenticated) return
+
+  try {
+    const validatedQuery = await searchSessionsSchema.validate(request.query, {
+      abortEarly: false,
+      stripUnknown: true
+    })
+    const result = await handleSearchSessions(request.user!.uuid, validatedQuery)
+    reply.status(result.status || 200).send(result.response)
+  } catch (error: any) {
+    logger.error({ message: 'Search sessions error', error })
+    reply.status(500).send({ error: 'Internal server error' })
+  }
+})
+
+// Session Replay: Export session data
+app.get('/spotlight/analytics/sessions/:sessionUuid/export', {
+  preHandler: [sessionExportRateLimiter]
+}, async (request: AuthenticatedRequest, reply: FastifyReply) => {
+  const authenticated = await authenticateJWT(request, reply)
+  if (!authenticated) return
+
+  try {
+    const { sessionUuid } = request.params as { sessionUuid: string }
+    const validatedQuery = await exportSessionSchema.validate(request.query, {
+      abortEarly: false,
+      stripUnknown: true
+    })
+
+    const result = await handleExportSession(request.user!.uuid, sessionUuid, validatedQuery)
+
+    if (result.error) {
+      reply.status(result.status || 500).send(result.response)
+      return
+    }
+
+    const format = validatedQuery?.format || 'json'
+    const filename = `session-${sessionUuid}-${Date.now()}.${format}`
+
+    reply.header('Content-Disposition', `attachment; filename="${filename}"`)
+    reply.header('Content-Type', format === 'json' ? 'application/json' : 'text/csv')
+    reply.status(200).send(result.response)
+  } catch (error: any) {
+    logger.error({ message: 'Export session error', error })
+    reply.status(500).send({ error: 'Internal server error' })
+  }
+})
+
+// Session Analytics Summary
+app.get('/spotlight/analytics/sessions/summary', {
+  preHandler: [analyticsSummaryRateLimiter]
+}, async (request: AuthenticatedRequest, reply: FastifyReply) => {
+  const authenticated = await authenticateJWT(request, reply)
+  if (!authenticated) return
+
+  try {
+    const result = await handleSessionAnalyticsSummary(request.user!.uuid)
+    reply.status(result.status || 200).send(result.response)
+  } catch (error: any) {
+    logger.error({ message: 'Fetch session analytics summary error', error })
+    reply.status(500).send({ error: 'Internal server error' })
+  }
+})
+
+// Session Analytics Time Series
+app.get('/spotlight/analytics/sessions/timeseries', async (request: AuthenticatedRequest, reply: FastifyReply) => {
+  const authenticated = await authenticateJWT(request, reply)
+  if (!authenticated) return
+
+  try {
+    const validatedQuery = await analyticsTimeSeriesSchema.validate(request.query, {
+      abortEarly: false,
+      stripUnknown: true
+    })
+    const result = await handleSessionAnalyticsTimeSeries(request.user!.uuid, validatedQuery)
+    reply.status(result.status || 200).send(result.response)
+  } catch (error: any) {
+    logger.error({ message: 'Fetch session analytics time series error', error })
+    reply.status(500).send({ error: 'Internal server error' })
+  }
+})
+
+// Redaction Rules CRUD
+app.get('/spotlight/redaction-rules', async (request: AuthenticatedRequest, reply: FastifyReply) => {
+  const authenticated = await authenticateJWT(request, reply)
+  if (!authenticated) return
+
+  try {
+    const result = await handleFetchRedactionRules(request.user!.uuid)
+    reply.status(result.status || 200).send(result.response)
+  } catch (error: any) {
+    logger.error({ message: 'Fetch redaction rules error', error })
+    reply.status(500).send({ error: 'Internal server error' })
+  }
+})
+
+app.post('/spotlight/redaction-rules', {
+  preHandler: [redactionRuleRateLimiter]
+}, async (request: AuthenticatedRequest, reply: FastifyReply) => {
+  const authenticated = await authenticateJWT(request, reply)
+  if (!authenticated) return
+
+  try {
+    const validatedBody = await createRedactionRuleSchema.validate(request.body, {
+      abortEarly: false,
+      stripUnknown: true
+    })
+    const result = await handleCreateRedactionRule(request.user!.uuid, validatedBody)
+    reply.status(result.status || 200).send(result.response)
+  } catch (error: any) {
+    logger.error({ message: 'Create redaction rule error', error })
+    reply.status(500).send({ error: 'Internal server error' })
+  }
+})
+
+app.put('/spotlight/redaction-rules/:ruleUuid', {
+  preHandler: [redactionRuleRateLimiter]
+}, async (request: AuthenticatedRequest, reply: FastifyReply) => {
+  const authenticated = await authenticateJWT(request, reply)
+  if (!authenticated) return
+
+  try {
+    const { ruleUuid } = request.params as { ruleUuid: string }
+    const validatedBody = await updateRedactionRuleSchema.validate(request.body, {
+      abortEarly: false,
+      stripUnknown: true
+    })
+    const result = await handleUpdateRedactionRule(request.user!.uuid, ruleUuid, validatedBody)
+    reply.status(result.status || 200).send(result.response)
+  } catch (error: any) {
+    logger.error({ message: 'Update redaction rule error', error })
+    reply.status(500).send({ error: 'Internal server error' })
+  }
+})
+
+app.delete('/spotlight/redaction-rules/:ruleUuid', {
+  preHandler: [redactionRuleRateLimiter]
+}, async (request: AuthenticatedRequest, reply: FastifyReply) => {
+  const authenticated = await authenticateJWT(request, reply)
+  if (!authenticated) return
+
+  try {
+    const { ruleUuid } = request.params as { ruleUuid: string }
+    const result = await handleDeleteRedactionRule(request.user!.uuid, ruleUuid)
+    reply.status(result.status || 200).send(result.response)
+  } catch (error: any) {
+    logger.error({ message: 'Delete redaction rule error', error })
     reply.status(500).send({ error: 'Internal server error' })
   }
 })
