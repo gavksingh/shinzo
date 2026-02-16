@@ -1,10 +1,21 @@
 import fastify, { FastifyReply, FastifyRequest } from 'fastify'
 import fastifyCors from '@fastify/cors'
 import fastifyRateLimit from '@fastify/rate-limit'
+import helmet from '@fastify/helmet'
+import csrf from '@fastify/csrf-protection'
+import compress from '@fastify/compress'
 import { PORT, RATE_LIMIT_WINDOW, RATE_LIMIT_MAX, MAX_PAYLOAD_SIZE, LOG_LEVEL } from './config'
 import { logger, pinoConfig } from './logger'
 import { sequelize, getPoolStats } from './dbClient'
 import { authenticateJWT, AuthenticatedRequest, authenticatedShinzoCredentials, getProviderCredentials, constructModelAPIResponseHeaders } from './middleware/auth'
+import {
+  sessionSearchRateLimiter,
+  sessionExportRateLimiter,
+  redactionRuleRateLimiter,
+  sharedSessionRateLimiter,
+  analyticsSummaryRateLimiter
+} from './middleware/rateLimiter'
+import { performanceMonitoring, getPerformanceStats, getEndpointStats, getSlowestRequests } from './middleware/performance'
 import { PassThrough } from 'stream'
 
 // Type guard for streaming responses
@@ -126,10 +137,10 @@ import {
 
 logger.info('STARTUP: server.ts - All imports loaded, creating Fastify instance')
 
-// Create Fastify instance
+// Create Fastify instance with security configuration
 const app = fastify({
   logger: pinoConfig('backend'),
-  bodyLimit: parseInt(MAX_PAYLOAD_SIZE.replace('mb', '')) * 1024 * 1024,
+  bodyLimit: 1 * 1024 * 1024, // 1MB global limit to prevent DoS via large payloads
 })
 
 // Register plugins
@@ -143,7 +154,39 @@ app.register(fastifyRateLimit, {
   timeWindow: RATE_LIMIT_WINDOW
 })
 
+// Register security headers (helmet)
+await app.register(helmet, {
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      imgSrc: ["'self'", 'data:', 'https:'],
+      connectSrc: ["'self'"],
+      fontSrc: ["'self'"],
+      objectSrc: ["'none'"],
+      mediaSrc: ["'self'"],
+      frameSrc: ["'none'"],
+    },
+  },
+  xssFilter: true,
+  noSniff: true,
+  referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
+})
+
+// Register CSRF protection
+await app.register(csrf)
+
+// Register response compression (gzip/brotli)
+await app.register(compress, {
+  global: true,
+  encodings: ['gzip', 'deflate', 'br'],
+  threshold: 1024, // Only compress responses > 1KB
+})
+
 // Request logging hook for debug/trace level
+app.addHook('preHandler', performanceMonitoring)
+
 app.addHook('preHandler', async (request, reply) => {
   if (LOG_LEVEL === 'debug' || LOG_LEVEL === 'trace') {
     logger.debug({
@@ -227,6 +270,24 @@ app.get('/health/deep', async (request, reply) => {
       error: error.message
     })
   }
+})
+
+// Internal performance monitoring endpoints
+app.get('/internal/performance/stats', async (request, reply) => {
+  const stats = getPerformanceStats()
+  return reply.send(stats)
+})
+
+app.get('/internal/performance/endpoint/:pattern', async (request: FastifyRequest<{ Params: { pattern: string } }>, reply) => {
+  const { pattern } = request.params
+  const stats = getEndpointStats(pattern)
+  return reply.send(stats)
+})
+
+app.get('/internal/performance/slow', async (request: FastifyRequest<{ Querystring: { limit?: string } }>, reply) => {
+  const limit = request.query.limit ? parseInt(request.query.limit) : 10
+  const slow = getSlowestRequests(limit)
+  return reply.send({ slowest_requests: slow })
 })
 
 // Authentication endpoints
@@ -1133,7 +1194,9 @@ app.get('/spotlight/analytics/sessions/:sessionUuid/share', async (request: Auth
 })
 
 // Public shared session endpoint (no authentication required)
-app.get('/spotlight/analytics/sessions/shared/:shareToken', async (request: FastifyRequest, reply: FastifyReply) => {
+app.get('/spotlight/analytics/sessions/shared/:shareToken', {
+  preHandler: [sharedSessionRateLimiter]
+}, async (request: FastifyRequest, reply: FastifyReply) => {
   try {
     const { shareToken } = request.params as { shareToken: string }
     const result = await handleFetchSharedSessionDetail(shareToken)
@@ -1145,7 +1208,9 @@ app.get('/spotlight/analytics/sessions/shared/:shareToken', async (request: Fast
 })
 
 // Session Replay: Search sessions with advanced filters
-app.get('/spotlight/analytics/sessions/search', async (request: AuthenticatedRequest, reply: FastifyReply) => {
+app.get('/spotlight/analytics/sessions/search', {
+  preHandler: [sessionSearchRateLimiter]
+}, async (request: AuthenticatedRequest, reply: FastifyReply) => {
   const authenticated = await authenticateJWT(request, reply)
   if (!authenticated) return
 
@@ -1163,7 +1228,9 @@ app.get('/spotlight/analytics/sessions/search', async (request: AuthenticatedReq
 })
 
 // Session Replay: Export session data
-app.get('/spotlight/analytics/sessions/:sessionUuid/export', async (request: AuthenticatedRequest, reply: FastifyReply) => {
+app.get('/spotlight/analytics/sessions/:sessionUuid/export', {
+  preHandler: [sessionExportRateLimiter]
+}, async (request: AuthenticatedRequest, reply: FastifyReply) => {
   const authenticated = await authenticateJWT(request, reply)
   if (!authenticated) return
 
@@ -1194,7 +1261,9 @@ app.get('/spotlight/analytics/sessions/:sessionUuid/export', async (request: Aut
 })
 
 // Session Analytics Summary
-app.get('/spotlight/analytics/sessions/summary', async (request: AuthenticatedRequest, reply: FastifyReply) => {
+app.get('/spotlight/analytics/sessions/summary', {
+  preHandler: [analyticsSummaryRateLimiter]
+}, async (request: AuthenticatedRequest, reply: FastifyReply) => {
   const authenticated = await authenticateJWT(request, reply)
   if (!authenticated) return
 
@@ -1239,7 +1308,9 @@ app.get('/spotlight/redaction-rules', async (request: AuthenticatedRequest, repl
   }
 })
 
-app.post('/spotlight/redaction-rules', async (request: AuthenticatedRequest, reply: FastifyReply) => {
+app.post('/spotlight/redaction-rules', {
+  preHandler: [redactionRuleRateLimiter]
+}, async (request: AuthenticatedRequest, reply: FastifyReply) => {
   const authenticated = await authenticateJWT(request, reply)
   if (!authenticated) return
 
@@ -1256,7 +1327,9 @@ app.post('/spotlight/redaction-rules', async (request: AuthenticatedRequest, rep
   }
 })
 
-app.put('/spotlight/redaction-rules/:ruleUuid', async (request: AuthenticatedRequest, reply: FastifyReply) => {
+app.put('/spotlight/redaction-rules/:ruleUuid', {
+  preHandler: [redactionRuleRateLimiter]
+}, async (request: AuthenticatedRequest, reply: FastifyReply) => {
   const authenticated = await authenticateJWT(request, reply)
   if (!authenticated) return
 
@@ -1274,7 +1347,9 @@ app.put('/spotlight/redaction-rules/:ruleUuid', async (request: AuthenticatedReq
   }
 })
 
-app.delete('/spotlight/redaction-rules/:ruleUuid', async (request: AuthenticatedRequest, reply: FastifyReply) => {
+app.delete('/spotlight/redaction-rules/:ruleUuid', {
+  preHandler: [redactionRuleRateLimiter]
+}, async (request: AuthenticatedRequest, reply: FastifyReply) => {
   const authenticated = await authenticateJWT(request, reply)
   if (!authenticated) return
 

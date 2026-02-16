@@ -2,6 +2,118 @@ import { RedactionRule } from '../models/spotlight/RedactionRule'
 import { logger } from '../logger'
 
 // ============================================================================
+// ReDoS Protection
+// ============================================================================
+
+interface PatternValidationResult {
+    valid: boolean
+    reason?: string
+}
+
+const DANGEROUS_PATTERNS = [
+    /\(\w\+\)\+/,  // Nested quantifiers like (a+)+
+    /\(\w\*\)\*/,  // Nested quantifiers like (a*)*
+    /\(\w\+\)\*/,  // Mixed quantifiers like (a+)*
+    /\(\[.*\]\+\)\+/,  // Nested character class quantifiers
+]
+
+const MAX_PATTERN_LENGTH = 500
+const MAX_ALTERNATIONS = 10
+const REGEX_TIMEOUT_MS = 100
+
+/**
+ * Validates a regex pattern to prevent ReDoS attacks
+ * @param pattern - The regex pattern to validate
+ * @returns Validation result with reason if invalid
+ */
+export function validateRegexPattern(pattern: string): PatternValidationResult {
+    // Check pattern length
+    if (pattern.length > MAX_PATTERN_LENGTH) {
+        return {
+            valid: false,
+            reason: `Pattern too long (max ${MAX_PATTERN_LENGTH} characters)`
+        }
+    }
+
+    // Check for dangerous nested quantifiers
+    for (const dangerousPattern of DANGEROUS_PATTERNS) {
+        if (dangerousPattern.test(pattern)) {
+            return {
+                valid: false,
+                reason: 'Pattern contains potentially dangerous nested quantifiers that could cause ReDoS'
+            }
+        }
+    }
+
+    // Check for excessive alternations
+    const alternationCount = (pattern.match(/\|/g) || []).length
+    if (alternationCount > MAX_ALTERNATIONS) {
+        return {
+            valid: false,
+            reason: `Too many alternations (max ${MAX_ALTERNATIONS})`
+        }
+    }
+
+    // Try to compile the regex
+    try {
+        new RegExp(pattern)
+    } catch (e) {
+        return {
+            valid: false,
+            reason: `Invalid regex pattern: ${(e as Error).message}`
+        }
+    }
+
+    return { valid: true }
+}
+
+/**
+ * Safely executes a regex replacement with timeout protection
+ * @param text - The text to search
+ * @param pattern - The regex pattern
+ * @param replacement - The replacement string
+ * @returns The text with replacements, or original text if timeout
+ */
+function safeRegexReplace(text: string, pattern: string, replacement: string): string {
+    try {
+        const regex = new RegExp(pattern, 'gi')
+        const startTime = Date.now()
+
+        // For very long texts, process in chunks to prevent timeout
+        if (text.length > 10000) {
+            const chunkSize = 5000
+            let result = ''
+            for (let i = 0; i < text.length; i += chunkSize) {
+                const chunk = text.slice(i, i + chunkSize)
+                const replaced = chunk.replace(regex, replacement)
+
+                // Check timeout
+                if (Date.now() - startTime > REGEX_TIMEOUT_MS) {
+                    logger.warn({
+                        message: 'Regex execution timeout, returning partial result',
+                        pattern,
+                        processedLength: result.length + replaced.length
+                    })
+                    return result + replaced + text.slice(i + chunkSize)
+                }
+
+                result += replaced
+            }
+            return result
+        }
+
+        return text.replace(regex, replacement)
+    } catch (e) {
+        logger.warn({
+            message: 'Regex execution error',
+            pattern,
+            error: (e as Error).message
+        })
+        return text
+    }
+}
+
+// ============================================================================
 // Built-in PII detection patterns
 // ============================================================================
 
@@ -87,13 +199,7 @@ export async function getRedactionRules(userUuid: string) {
 function redactString(value: string, rules: Array<{ pattern: string; replacement: string }>): string {
     let result = value
     for (const rule of rules) {
-        try {
-            const regex = new RegExp(rule.pattern, 'gi')
-            result = result.replace(regex, rule.replacement)
-        } catch (e) {
-            // Skip invalid patterns
-            logger.warn({ message: 'Invalid redaction pattern', pattern: rule.pattern })
-        }
+        result = safeRegexReplace(result, rule.pattern, rule.replacement)
     }
     return result
 }

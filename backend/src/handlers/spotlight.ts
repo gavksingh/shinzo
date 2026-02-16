@@ -1,6 +1,8 @@
 import * as yup from 'yup'
 import { Session, Interaction, ToolUsage, RedactionRule } from '../models'
 import { getRedactionRules, applyRedaction, convertSessionToCSV, ensureBuiltinRules } from '../services/redactionService'
+import { createAuditLog, AuditActions } from '../services/auditLogService'
+import { generateCacheKey, getCache, setCache, CACHE_TTL } from '../services/cacheService'
 import { logger } from '../logger'
 import { Op } from 'sequelize'
 import axios from 'axios'
@@ -64,16 +66,44 @@ export const testProviderKeySchema = yup.object({
 }).required()
 
 export const fetchAnalyticsSchema = yup.object({
-  start_date: yup.date().optional(),
-  end_date: yup.date().optional(),
-  session_id: yup.string().optional(),
-  model: yup.string().optional(),
-  provider: yup.string().optional(),
-  // Pagination params
-  limit: yup.number().optional(),
-  offset: yup.number().optional(),
-  sort: yup.string().optional(),
-  sortDirection: yup.string().optional().oneOf(['asc', 'desc']),
+  start_date: yup.date()
+    .max(new Date(), 'Cannot query future dates')
+    .optional(),
+  end_date: yup.date()
+    .when('start_date', {
+      is: (val: any) => val !== undefined && val !== null,
+      then: (schema) => schema.min(yup.ref('start_date'), 'End date must be after start date'),
+      otherwise: (schema) => schema.optional()
+    })
+    .optional(),
+  session_id: yup.string()
+    .max(100, 'Session ID too long')
+    .trim()
+    .optional(),
+  model: yup.string()
+    .max(100, 'Model name too long')
+    .trim()
+    .optional(),
+  provider: yup.string()
+    .max(50, 'Provider name too long')
+    .trim()
+    .optional(),
+  limit: yup.number()
+    .integer('Limit must be an integer')
+    .min(1, 'Minimum 1 result')
+    .max(100, 'Maximum 100 results')
+    .optional(),
+  offset: yup.number()
+    .integer('Offset must be an integer')
+    .min(0, 'Offset cannot be negative')
+    .optional(),
+  sort: yup.string()
+    .max(50, 'Sort field too long')
+    .trim()
+    .optional(),
+  sortDirection: yup.string()
+    .oneOf(['asc', 'desc'], 'Invalid sort direction')
+    .optional(),
 }).optional()
 
 type FetchAnalyticsFilters = yup.InferType<typeof fetchAnalyticsSchema>
@@ -1022,7 +1052,7 @@ export const handleFetchTokenAnalytics = async (
   filters: FetchAnalyticsFilters = {}
 ) => {
   try {
-    const where: any = { user_uuid: userUuid, status: 'success' }
+    const where: any = { userUuid: userUuid, status: 'success' }
 
     if (filters.start_date) {
       where.request_timestamp = { ...where.request_timestamp, [Op.gte]: filters.start_date }
@@ -1232,7 +1262,7 @@ export const handleFetchSessionDetail = async (userUuid: string, sessionUuid: st
     logger.debug({ message: 'Fetching session detail', userUuid, sessionUuid })
 
     const session = await Session.findOne({
-      where: { uuid: sessionUuid, user_uuid: userUuid },
+      where: { uuid: sessionUuid, userUuid: userUuid },
       include: [
         {
           model: Interaction,
@@ -1446,7 +1476,7 @@ export const handleCreateSessionShare = async (userUuid: string, sessionUuid: st
   try {
     // Verify session exists and belongs to user
     const session = await Session.findOne({
-      where: { uuid: sessionUuid, user_uuid: userUuid }
+      where: { uuid: sessionUuid, userUuid: userUuid }
     })
 
     if (!session) {
@@ -1497,6 +1527,15 @@ export const handleCreateSessionShare = async (userUuid: string, sessionUuid: st
 
     logger.info({ message: 'Session share created', userUuid, sessionUuid, shareUuid: newShare.uuid })
 
+    // Audit log the share creation
+    await createAuditLog({
+      userUuid: userUuid,
+      action: AuditActions.SESSION_SHARE_CREATE,
+      resourceType: 'session',
+      resourceUuid: sessionUuid,
+      metadata: { share_uuid: newShare.uuid, share_token: newShare.share_token }
+    })
+
     return {
       response: {
         share_token: newShare.share_token,
@@ -1519,7 +1558,7 @@ export const handleDeleteSessionShare = async (userUuid: string, sessionUuid: st
   try {
     // Verify session exists and belongs to user
     const session = await Session.findOne({
-      where: { uuid: sessionUuid, user_uuid: userUuid }
+      where: { uuid: sessionUuid, userUuid: userUuid }
     })
 
     if (!session) {
@@ -1547,7 +1586,18 @@ export const handleDeleteSessionShare = async (userUuid: string, sessionUuid: st
       }
     }
 
+    const shareUuid = (results as any)[0].uuid
+
     logger.info({ message: 'Session share deactivated', userUuid, sessionUuid })
+
+    // Audit log the share deletion
+    await createAuditLog({
+      userUuid: userUuid,
+      action: AuditActions.SESSION_SHARE_DELETE,
+      resourceType: 'session',
+      resourceUuid: sessionUuid,
+      metadata: { share_uuid: shareUuid }
+    })
 
     return {
       response: { message: 'Session share deactivated' },
@@ -1567,7 +1617,7 @@ export const handleGetSessionShareStatus = async (userUuid: string, sessionUuid:
   try {
     // Verify session exists and belongs to user
     const session = await Session.findOne({
-      where: { uuid: sessionUuid, user_uuid: userUuid }
+      where: { uuid: sessionUuid, userUuid: userUuid }
     })
 
     if (!session) {
@@ -1732,17 +1782,51 @@ export const handleFetchSharedSessionDetail = async (shareToken: string) => {
 // ============================================================================
 
 export const searchSessionsSchema = yup.object({
-  start_date: yup.date().optional(),
-  end_date: yup.date().optional(),
-  error_type: yup.string().optional(),
+  start_date: yup.date()
+    .max(new Date(), 'Cannot search future dates')
+    .optional(),
+  end_date: yup.date()
+    .when('start_date', {
+      is: (val: any) => val !== undefined && val !== null,
+      then: (schema) => schema.min(yup.ref('start_date'), 'End date must be after start date'),
+      otherwise: (schema) => schema.optional()
+    })
+    .optional(),
+  error_type: yup.string()
+    .max(100, 'Error type too long')
+    .trim()
+    .optional(),
   has_errors: yup.boolean().optional(),
-  session_id: yup.string().optional(),
-  model: yup.string().optional(),
-  provider: yup.string().optional(),
-  limit: yup.number().default(25),
-  offset: yup.number().default(0),
-  sort: yup.string().default('start_time'),
-  sortDirection: yup.string().oneOf(['asc', 'desc']).default('desc')
+  session_id: yup.string()
+    .max(100, 'Session ID too long')
+    .trim()
+    .optional(),
+  model: yup.string()
+    .max(100, 'Model name too long')
+    .trim()
+    .optional(),
+  provider: yup.string()
+    .max(50, 'Provider name too long')
+    .trim()
+    .optional(),
+  limit: yup.number()
+    .integer('Limit must be an integer')
+    .min(1, 'Minimum 1 result')
+    .max(100, 'Maximum 100 results per request')
+    .default(25),
+  offset: yup.number()
+    .integer('Offset must be an integer')
+    .min(0, 'Offset cannot be negative')
+    .default(0),
+  sort: yup.string()
+    .oneOf(
+      ['start_time', 'end_time', 'total_requests', 'session_id', 'error_count'],
+      'Invalid sort column'
+    )
+    .default('start_time'),
+  sortDirection: yup.string()
+    .oneOf(['asc', 'desc'], 'Invalid sort direction')
+    .default('desc')
 }).optional()
 
 export const handleSearchSessions = async (
@@ -1752,7 +1836,20 @@ export const handleSearchSessions = async (
   try {
     logger.debug({ message: 'Searching sessions', userUuid, filters })
 
-    const whereClause: any = { user_uuid: userUuid }
+    // Generate cache key based on filters
+    const cacheKey = generateCacheKey('search', userUuid, filters)
+
+    // Try cache first
+    const cached = await getCache<any>(cacheKey)
+    if (cached) {
+      logger.debug({ message: 'Cache hit for session search', userUuid })
+      return { response: cached, status: 200 }
+    }
+
+    // Cache miss - query database
+    logger.debug({ message: 'Cache miss for session search', userUuid })
+
+    const whereClause: any = { userUuid: userUuid }
 
     // Date range filters
     if (filters?.start_date) {
@@ -1812,13 +1909,18 @@ export const handleSearchSessions = async (
       distinct: true // Needed when using include with hasMany
     })
 
+    const result = {
+      sessions: sessions.rows,
+      total: sessions.count,
+      limit: filters?.limit || 25,
+      offset: filters?.offset || 0,
+    }
+
+    // Store in cache with 5 minute TTL
+    await setCache(cacheKey, result, CACHE_TTL.SEARCH)
+
     return {
-      response: {
-        sessions: sessions.rows,
-        total: sessions.count,
-        limit: filters?.limit || 25,
-        offset: filters?.offset || 0
-      },
+      response: result,
       status: 200
     }
   } catch (error) {
@@ -1832,8 +1934,13 @@ export const handleSearchSessions = async (
 }
 
 export const exportSessionSchema = yup.object({
-  format: yup.string().oneOf(['json', 'csv']).default('json'),
-  apply_redaction: yup.boolean().default(false)
+  format: yup.string()
+    .oneOf(['json', 'csv'], 'Invalid export format')
+    .default('json'),
+  apply_redaction: yup.boolean()
+    .default(false),
+  include_metadata: yup.boolean()
+    .default(true)
 }).optional()
 
 export const handleExportSession = async (
@@ -1846,7 +1953,7 @@ export const handleExportSession = async (
 
     // Fetch complete session with all related data
     const session = await Session.findOne({
-      where: { uuid: sessionUuid, user_uuid: userUuid },
+      where: { uuid: sessionUuid, userUuid: userUuid },
       include: [
         {
           model: Interaction,
@@ -1878,11 +1985,30 @@ export const handleExportSession = async (
 
     if (options?.format === 'csv') {
       const csvContent = convertSessionToCSV(exportData)
+
+      // Audit log the export
+      await createAuditLog({
+        userUuid: userUuid,
+        action: AuditActions.SESSION_EXPORT,
+        resourceType: 'session',
+        resourceUuid: sessionUuid,
+        metadata: { format: 'csv', apply_redaction: options?.apply_redaction || false }
+      })
+
       return {
         response: csvContent,
         status: 200
       }
     }
+
+    // Audit log the export
+    await createAuditLog({
+      userUuid: userUuid,
+      action: AuditActions.SESSION_EXPORT,
+      resourceType: 'session',
+      resourceUuid: sessionUuid,
+      metadata: { format: 'json', apply_redaction: options?.apply_redaction || false }
+    })
 
     return {
       response: exportData,
@@ -1909,6 +2035,19 @@ export const analyticsTimeSeriesSchema = yup.object({
 export const handleSessionAnalyticsSummary = async (userUuid: string) => {
   try {
     logger.debug({ message: 'Fetching session analytics summary', userUuid })
+
+    // Generate cache key
+    const cacheKey = generateCacheKey('summary', userUuid)
+
+    // Try cache first
+    const cached = await getCache<any>(cacheKey)
+    if (cached) {
+      logger.debug({ message: 'Cache hit for analytics summary', userUuid })
+      return { response: cached, status: 200 }
+    }
+
+    // Cache miss - query database
+    logger.debug({ message: 'Cache miss for analytics summary', userUuid })
 
     // Total sessions + error sessions + average duration
     const [summaryResults] = await sequelize.query(`
@@ -1966,19 +2105,24 @@ export const handleSessionAnalyticsSummary = async (userUuid: string) => {
       ? Math.round((summary.error_sessions / summary.total_sessions) * 100)
       : 0
 
+    const result = {
+      total_sessions: summary.total_sessions || 0,
+      error_sessions: summary.error_sessions || 0,
+      error_rate: errorRate,
+      avg_duration_seconds: parseFloat(summary.avg_duration_seconds) || 0,
+      total_interactions: summary.total_interactions || 0,
+      sessions_24h: trends.sessions_24h || 0,
+      sessions_7d: trends.sessions_7d || 0,
+      sessions_30d: trends.sessions_30d || 0,
+      top_models: modelResults || [],
+      top_providers: providerResults || [],
+    }
+
+    // Store in cache with 10 minute TTL
+    await setCache(cacheKey, result, CACHE_TTL.SUMMARY)
+
     return {
-      response: {
-        total_sessions: summary.total_sessions || 0,
-        error_sessions: summary.error_sessions || 0,
-        error_rate: errorRate,
-        avg_duration_seconds: parseFloat(summary.avg_duration_seconds) || 0,
-        total_interactions: summary.total_interactions || 0,
-        sessions_24h: trends.sessions_24h || 0,
-        sessions_7d: trends.sessions_7d || 0,
-        sessions_30d: trends.sessions_30d || 0,
-        top_models: modelResults || [],
-        top_providers: providerResults || [],
-      },
+      response: result,
       status: 200
     }
   } catch (error) {
@@ -2056,27 +2200,65 @@ export const handleSessionAnalyticsTimeSeries = async (
 // ============================================================================
 
 export const createRedactionRuleSchema = yup.object({
-  rule_name: yup.string().required('Rule name is required'),
-  rule_type: yup.string().oneOf(['regex', 'field_name']).required('Rule type is required'),
-  pattern: yup.string().required('Pattern is required'),
-  replacement: yup.string().default('[REDACTED]'),
-  is_enabled: yup.boolean().default(true),
-  target_fields: yup.array().of(yup.string().required()).default(['request_data', 'response_data', 'tool_input', 'tool_output', 'system_prompt']),
+  rule_name: yup.string()
+    .required('Rule name is required')
+    .min(3, 'Rule name must be at least 3 characters')
+    .max(100, 'Rule name too long')
+    .matches(/^[a-zA-Z0-9\s\-_]+$/, 'Only alphanumeric characters, spaces, hyphens, and underscores allowed')
+    .trim(),
+  rule_type: yup.string()
+    .oneOf(['regex', 'field_name'], 'Invalid rule type')
+    .required('Rule type is required'),
+  pattern: yup.string()
+    .required('Pattern is required')
+    .max(500, 'Pattern too long'),
+  replacement: yup.string()
+    .max(100, 'Replacement text too long')
+    .default('[REDACTED]'),
+  is_enabled: yup.boolean()
+    .default(true),
+  target_fields: yup.array()
+    .of(yup.string()
+      .oneOf(
+        ['request_data', 'response_data', 'tool_input', 'tool_output', 'system_prompt', 'environment', 'metadata'],
+        'Invalid target field'
+      )
+      .required())
+    .min(1, 'At least one target field required')
+    .default(['request_data', 'response_data', 'tool_input', 'tool_output', 'system_prompt']),
 }).required()
 
 export const updateRedactionRuleSchema = yup.object({
-  rule_name: yup.string().optional(),
-  pattern: yup.string().optional(),
-  replacement: yup.string().optional(),
-  is_enabled: yup.boolean().optional(),
-  target_fields: yup.array().of(yup.string().required()).optional(),
+  rule_name: yup.string()
+    .min(3, 'Rule name must be at least 3 characters')
+    .max(100, 'Rule name too long')
+    .matches(/^[a-zA-Z0-9\s\-_]+$/, 'Only alphanumeric characters, spaces, hyphens, and underscores allowed')
+    .trim()
+    .optional(),
+  pattern: yup.string()
+    .max(500, 'Pattern too long')
+    .optional(),
+  replacement: yup.string()
+    .max(100, 'Replacement text too long')
+    .optional(),
+  is_enabled: yup.boolean()
+    .optional(),
+  target_fields: yup.array()
+    .of(yup.string()
+      .oneOf(
+        ['request_data', 'response_data', 'tool_input', 'tool_output', 'system_prompt', 'environment', 'metadata'],
+        'Invalid target field'
+      )
+      .required())
+    .min(1, 'At least one target field required')
+    .optional(),
 }).required()
 
 export const handleFetchRedactionRules = async (userUuid: string) => {
   try {
     await ensureBuiltinRules(userUuid)
     const rules = await RedactionRule.findAll({
-      where: { user_uuid: userUuid },
+      where: { userUuid: userUuid },
       order: [['is_builtin', 'DESC'], ['created_at', 'ASC']],
     })
     return { response: rules, status: 200 }
@@ -2101,7 +2283,7 @@ export const handleCreateRedactionRule = async (
     }
 
     const rule = await RedactionRule.create({
-      user_uuid: userUuid,
+      userUuid: userUuid,
       rule_name: data.rule_name,
       rule_type: data.rule_type,
       pattern: data.pattern,
@@ -2109,6 +2291,15 @@ export const handleCreateRedactionRule = async (
       is_enabled: data.is_enabled ?? true,
       is_builtin: false,
       target_fields: data.target_fields || ['request_data', 'response_data', 'tool_input', 'tool_output', 'system_prompt'],
+    })
+
+    // Audit log the rule creation
+    await createAuditLog({
+      userUuid: userUuid,
+      action: AuditActions.REDACTION_RULE_CREATE,
+      resourceType: 'redaction_rule',
+      resourceUuid: rule.uuid,
+      metadata: { rule_name: rule.rule_name, rule_type: rule.rule_type }
     })
 
     return { response: rule, status: 201 }
@@ -2125,7 +2316,7 @@ export const handleUpdateRedactionRule = async (
 ) => {
   try {
     const rule = await RedactionRule.findOne({
-      where: { uuid: ruleUuid, user_uuid: userUuid }
+      where: { uuid: ruleUuid, userUuid: userUuid }
     })
 
     if (!rule) {
@@ -2158,6 +2349,19 @@ export const handleUpdateRedactionRule = async (
       })
     }
 
+    // Audit log the rule update
+    await createAuditLog({
+      userUuid: userUuid,
+      action: AuditActions.REDACTION_RULE_UPDATE,
+      resourceType: 'redaction_rule',
+      resourceUuid: rule.uuid,
+      metadata: {
+        rule_name: rule.rule_name,
+        changes: data,
+        is_builtin: rule.is_builtin
+      }
+    })
+
     return { response: await rule.reload(), status: 200 }
   } catch (error) {
     logger.error({ message: 'Error updating redaction rule', error, userUuid, ruleUuid })
@@ -2171,7 +2375,7 @@ export const handleDeleteRedactionRule = async (
 ) => {
   try {
     const rule = await RedactionRule.findOne({
-      where: { uuid: ruleUuid, user_uuid: userUuid }
+      where: { uuid: ruleUuid, userUuid: userUuid }
     })
 
     if (!rule) {
@@ -2181,6 +2385,15 @@ export const handleDeleteRedactionRule = async (
     if (rule.is_builtin) {
       return { response: 'Cannot delete built-in rules. You can disable them instead.', error: true, status: 403 }
     }
+
+    // Audit log the rule deletion
+    await createAuditLog({
+      userUuid: userUuid,
+      action: AuditActions.REDACTION_RULE_DELETE,
+      resourceType: 'redaction_rule',
+      resourceUuid: rule.uuid,
+      metadata: { rule_name: rule.rule_name, rule_type: rule.rule_type }
+    })
 
     await rule.destroy()
     return { response: { message: 'Redaction rule deleted' }, status: 200 }
